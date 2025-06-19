@@ -1,20 +1,89 @@
 import torch
+from torch import Tensor
 
 
-def extend_grid(grid, k_extend=0):
-    # pad k to left and right
-    # grid shape: (batch, grid)
-    h = (grid[:, [-1]] - grid[:, [0]]) / (grid.shape[1] - 1)
+# ========== Shared Helper Functions ==========
 
-    for i in range(k_extend):
-        grid = torch.cat([grid[:, [0]] - h, grid], dim=1)
-        grid = torch.cat([grid, grid[:, [-1]] + h], dim=1)
+
+def _unsqueeze_inputs(x: Tensor, grid: Tensor) -> tuple[Tensor, Tensor]:
+    """Prepare tensors for batch operations by adding dimensions.
+
+    :param x: Input tensor of shape (num_splines, num_samples)
+    :type x: torch.Tensor
+    :param grid: Grid tensor of shape (num_splines, num_grid_points)
+    :type grid: torch.Tensor
+    :return: Tuple of reshaped tensors
+
+        - `x_unsqueezed`: `(num_splines, 1, num_samples)`
+        - `grid_unsqueezed`: `(num_splines, num_grid_points, 1)`
+
+    :rtype: tuple[torch.Tensor, torch.Tensor]
+    """
+    return x.unsqueeze(dim=1), grid.unsqueeze(dim=2)
+
+
+def _compute_B_km1(x: Tensor, grid: Tensor, k: int) -> Tensor:
+    """Compute B-spline basis of order k-1.
+
+    :param x: Input tensor of shape (num_splines, num_samples)
+    :type x: torch.Tensor
+    :param grid: Grid tensor of shape (num_splines, num_grid_points)
+    :type grid: torch.Tensor
+    :param k: Order of spline
+    :type k: int
+    :return: B-spline basis of order k-1
+    :rtype: torch.Tensor
+    :raises AssertionError: If result is not a Tensor
+    """
+    B_km1 = B_batch(x[:, 0], grid=grid[:, :, 0], k=k - 1, extend=False)
+    assert isinstance(B_km1, Tensor), "B_km1 must be a Tensor"
+    return B_km1
+
+
+def _safe_nan_zeroing(value: Tensor) -> Tensor:
+    mask = torch.isnan(value)
+    if mask.any():
+        value = torch.where(mask, torch.zeros_like(value), value)
+    return value
+
+
+# ========== Grid Extension Functions ==========
+
+
+def extend_grid(grid: Tensor, k_extend: int = 0, repeat: bool = False) -> Tensor:
+    """Extend grid points for B-spline basis.
+
+    :param grid: Grid tensor of shape (num_splines, num_grid_points)
+    :type grid: torch.Tensor
+    :param k_extend: Number of points to extend on both ends, defaults to 0
+    :type k_extend: int, optional
+    :param repeat: If True, repeat the first and last grid points, defaults to False
+    :type repeat: bool, optional
+    :return: Extended grid tensor of shape (num_splines, num_grid_points + 2 * k_extend)
+    :rtype: torch.Tensor
+    """
+    if repeat:
+        for _ in range(k_extend):
+            grid = torch.cat([grid[:, [0]], grid], dim=1)
+            grid = torch.cat([grid, grid[:, [-1]]], dim=1)
+    else:
+        h = (grid[:, [-1]] - grid[:, [0]]) / (grid.shape[1] - 1)
+        for _ in range(k_extend):
+            grid = torch.cat([grid[:, [0]] - h, grid], dim=1)
+            grid = torch.cat([grid, grid[:, [-1]] + h], dim=1)
     return grid
 
 
+# ========== B-spline Basis ==========
+
+
 def B_batch(
-    x, grid, k=0, extend=True, return_extended=False
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    x: Tensor,
+    grid: Tensor,
+    k: int = 0,
+    extend: bool = True,
+    return_extended: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """
     Evaludate x on B-spline bases
 
@@ -48,172 +117,177 @@ def B_batch(
     >>> B_batch(x, grids, k=k).shape
     torch.Size([5, 13, 100])
     """
-
-    # x shape: (size, x); grid shape: (size, grid)
-    if extend == True:
+    assert (
+        x.device == grid.device
+    ), f"x device: {x.device} != grid device: {grid.device}"
+    if extend:
         grid = extend_grid(grid, k_extend=k)
-
-    grid = grid.unsqueeze(dim=2)
-    x = x.unsqueeze(dim=1)
+    x, grid = _unsqueeze_inputs(x, grid)
 
     if k == 0:
-        value = (x >= grid[:, :-1]) * (x < grid[:, 1:])
+        value = (x >= grid[:, :-1]) & (x < grid[:, 1:])
     else:
-        B_km1 = B_batch(x[:, 0], grid=grid[:, :, 0], k=k - 1, extend=False)
+        B_km1 = _compute_B_km1(x, grid, k)
         value = (x - grid[:, : -(k + 1)]) / (
             grid[:, k:-1] - grid[:, : -(k + 1)]
         ) * B_km1[:, :-1] + (grid[:, k + 1 :] - x) / (
-            grid[:, k + 1 :] - grid[:, 1:(-k)]
-        ) * B_km1[
-            :, 1:
-        ]
-    if return_extended:
-        return value, grid
-    else:
-        return value
-
-
-def B_batch_mod(x, grid, k=0, extend=True, return_extended=False):
-    """
-    Modification to repeat the first k values of the grid to the left and
-    the last k values of the grid to the right
-    """
-
-    # x shape: (size, x); grid shape: (size, grid)
-    def extend_grid_mod(grid, k_extend=0):
-        # pad k to left and right
-        # grid shape: (batch, grid)
-        for i in range(k_extend):
-            grid = torch.cat([grid[:, [0]], grid], dim=1)
-            grid = torch.cat([grid, grid[:, [-1]]], dim=1)
-        return grid
-
-    if extend == True:
-        grid = extend_grid_mod(grid, k_extend=k)
-
-    grid = grid.unsqueeze(dim=2)
-    x = x.unsqueeze(dim=1)
-
-    if k == 0:
-        value = (x >= grid[:, :-1]) * (x < grid[:, 1:])
-    else:
-        B_km1 = B_batch(x[:, 0], grid=grid[:, :, 0], k=k - 1, extend=False)
-        value = (x - grid[:, : -(k + 1)]) / (
-            grid[:, k:-1] - grid[:, : -(k + 1)]
-        ) * B_km1[:, :-1] + (grid[:, k + 1 :] - x) / (
-            grid[:, k + 1 :] - grid[:, 1:(-k)]
+            grid[:, k + 1 :] - grid[:, 1:-k]
         ) * B_km1[
             :, 1:
         ]
 
-    ## Convert to 0 if the value is nan
-    for j in range(value.shape[1]):
-        if torch.all(torch.isnan(value[:, j, :])):
-            value[:, j, :] = torch.where(
-                torch.isnan(value[:, j, :]),
-                torch.zeros_like(value[:, j, :]),
-                value[:, j, :],
-            )
-
-    if return_extended:
-        return value, grid
-    else:
-        return value
+    return (value, grid) if return_extended else value
 
 
-def der_B_batch(x, grid, k=0, extend=True, return_extended=False):
+def B_batch_mod(
+    x: Tensor, grid: Tensor, k: int = 0, extend: bool = True, return_extended=False
+):
+    assert (
+        x.device == grid.device
+    ), f"x device: {x.device} != grid device: {grid.device}"
+    if extend:
+        grid = extend_grid(grid, k_extend=k, repeat=True)
+    x, grid = _unsqueeze_inputs(x, grid)
 
-    # x shape: (size, x); grid shape: (size, grid)
-
-    if extend == True:
-        grid = extend_grid(grid, k_extend=k)
-
-    grid = grid.unsqueeze(dim=2)
-    x = x.unsqueeze(dim=1)
-
-    ## Compute the derivative of B-spline basis functions
     if k == 0:
-        return 0
+        value = (x >= grid[:, :-1]) & (x < grid[:, 1:])
     else:
-        B_km1 = B_batch(x[:, 0], grid=grid[:, :, 0], k=k - 1, extend=False)
-        value = (
-            k / (grid[:, k:-1] - grid[:, : -(k + 1)]) * B_km1[:, :-1]
-            - k / (grid[:, k + 1 :] - grid[:, 1:(-k)]) * B_km1[:, 1:]
-        )
-    if return_extended:
-        return value, grid
-    else:
-        return value
+        B_km1 = _compute_B_km1(x, grid, k)
+        value = (x - grid[:, : -(k + 1)]) / (
+            grid[:, k:-1] - grid[:, : -(k + 1)]
+        ) * B_km1[:, :-1] + (grid[:, k + 1 :] - x) / (
+            grid[:, k + 1 :] - grid[:, 1:-k]
+        ) * B_km1[
+            :, 1:
+        ]
+
+    value = _safe_nan_zeroing(value)
+    return (value, grid) if return_extended else value
 
 
-def der_B_batch_mod(x, grid, k=0, extend=True, return_extended=False):
+# ========== Derivatives ==========
 
-    # x shape: (size, x); grid shape: (size, grid)
 
-    if extend == True:
+def der_B_batch(
+    x: Tensor,
+    grid: Tensor,
+    k: int = 0,
+    extend: bool = True,
+    return_extended: bool = False,
+):
+    if extend:
         grid = extend_grid(grid, k_extend=k)
-
-    grid = grid.unsqueeze(dim=2)
-    x = x.unsqueeze(dim=1)
-
-    ## Compute the derivative of B-spline basis functions
-    if k == 0:
-        return 0
-    else:
-        B_km1 = B_batch(x[:, 0], grid=grid[:, :, 0], k=k - 1, extend=False)
-        value = (
-            k / (grid[:, k:-1] - grid[:, : -(k + 1)]) * B_km1[:, :-1]
-            - k / (grid[:, k + 1 :] - grid[:, 1:(-k)]) * B_km1[:, 1:]
-        )
-    if return_extended:
-        return value, grid
-    else:
-        return value, B_km1
-
-
-def der_B_spline(x, grid, k=0, extend=True, return_extended=False):
-
-    # x shape: (size, x); grid shape: (size, grid)
-
-    if extend == True:
-        grid = extend_grid(grid, k_extend=k)
-
-    grid = grid.unsqueeze(dim=2)
-    x = x.unsqueeze(dim=1)
+    x, grid = _unsqueeze_inputs(x, grid)
 
     if k == 0:
         return 0
-    else:
-        B_km1 = B_batch(x[:, 0], grid=grid[:, :, 0], k=k - 1, extend=False)
-        value = k / (grid[:, k + 1 :] - grid[:, 1:(-k)]) * B_km1[:, 1:]
-    if return_extended:
-        return value, grid
-    else:
-        return value
+    B_km1 = _compute_B_km1(x, grid, k)
+    value = (
+        k / (grid[:, k:-1] - grid[:, : -(k + 1)]) * B_km1[:, :-1]
+        - k / (grid[:, k + 1 :] - grid[:, 1:-k]) * B_km1[:, 1:]
+    )
+    return (value, grid) if return_extended else value
 
 
-def coef2curve(x_eval, grid, coef, k, extend=True, repeated=False):
+def der2_B_batch(
+    x: Tensor,
+    grid: Tensor,
+    k: int = 0,
+    extend: bool = True,
+    return_extended: bool = False,
+):
+    """Compute the second derivative of B-spline basis functions with respect to x.
+
+    :param x: Input tensor of shape (number of splines, number of samples)
+    :type x: torch.Tensor
+    :param grid: Knot vector of shape (number of splines, number of grid points)
+    :type grid: torch.Tensor
+    :param k: Order of the B-spline, defaults to 0
+    :type k: int, optional
+    :param extend: Whether to extend the grid, defaults to True
+    :type extend: bool, optional
+    :param return_extended: Whether to return the extended grid, defaults to False
+    :type return_extended: bool, optional
+    :return: Second derivative of B-spline basis
+        Shape: (number of splines, number of basis, number of samples)
+    :rtype: torch.Tensor
     """
-    converting B-spline coefficients to B-spline curves. Evaluate x on B-spline curves (summing up B_batch results over B-spline basis).
+    if extend:
+        grid = extend_grid(grid, k_extend=k)
+    x, grid = _unsqueeze_inputs(x, grid)
 
-    Args:
-    -----
-        x_eval : 2D torch.tensor)
-            shape (number of splines, number of samples)
-        grid : 2D torch.tensor)
-            shape (number of splines, number of grid points)
-        coef : 2D torch.tensor)
-            shape (number of splines, number of coef params). number of coef params = number of grid intervals + k
-        k : int
-            the piecewise polynomial order of splines.
+    if k <= 1:
+        return 0
 
-    Returns:
+    B_km2 = _compute_B_km1(x, grid, k - 1)  # Actually calls k-2 recursion
+
+    denom1 = (grid[:, k:-1] - grid[:, : -(k + 1)]) * (
+        grid[:, k:-1] - grid[:, : -(k + 1)]
+    )
+    denom2 = (grid[:, k + 1 :] - grid[:, 1:-k]) * (grid[:, k + 1 :] - grid[:, 1:-k])
+
+    value = k * (k - 1) / denom1 * B_km2[:, :-1] - k * (k - 1) / denom2 * B_km2[:, 1:]
+
+    return (value, grid) if return_extended else value
+
+
+def der_B_spline(
+    x: Tensor,
+    grid: Tensor,
+    k: int = 0,
+    extend: bool = True,
+    return_extended: bool = False,
+):
+
+    if extend:
+        grid = extend_grid(grid, k_extend=k)
+    x, grid = _unsqueeze_inputs(x, grid)
+
+    if k == 0:
+        return 0
+    B_km1 = _compute_B_km1(x, grid, k)
+    value = k / (grid[:, k + 1 :] - grid[:, 1:-k]) * B_km1[:, 1:]
+    return (value, grid) if return_extended else value
+
+
+# ========== Curve and Coefficient Conversion ==========
+
+
+def coef2curve(
+    x_eval: Tensor,
+    grid: Tensor,
+    coef: Tensor,
+    k: int,
+    extend: bool = True,
+    repeated: bool = False,
+) -> Tensor:
+    """Convert B-spline coefficients to B-spline curves.
+
+    Evaluates x on B-spline curves by summing up B_batch results over B-spline basis.
+
+    :param x_eval: Input evaluation points
+    :type x_eval: torch.Tensor
+        Shape: (number_of_splines, number_of_samples)
+    :param grid: Grid points for spline evaluation
+    :type grid: torch.Tensor
+        Shape: (number_of_splines, number_of_grid_points)
+    :param coef: B-spline coefficients
+    :type coef: torch.Tensor
+        Shape: (number_of_splines, number_of_coefficients)
+        Note: number_of_coefficients = number_of_grid_intervals + k
+    :param k: Order of the B-spline
+    :type k: int
+    :param extend: Whether to extend grid points, defaults to True
+    :type extend: bool, optional
+    :param repeated: Whether to use repeated boundary points, defaults to False
+    :type repeated: bool, optional
+    :return: Evaluated B-spline curves
+    :rtype: torch.Tensor
+        Shape: (number_of_splines, number_of_samples)
+
+    Example:
     --------
-        y_eval : 2D torch.tensor
-            shape (number of splines, number of samples)
 
-    Example
-    -------
     >>> num_spline = 5
     >>> num_sample = 100
     >>> num_grid_interval = 10
@@ -224,67 +298,48 @@ def coef2curve(x_eval, grid, coef, k, extend=True, repeated=False):
     >>> coef2curve(x_eval, grids, coef, k=k).shape
     torch.Size([5, 100])
     """
-    # x_eval: (size, batch), grid: (size, grid), coef: (size, coef)
-    # coef: (size, coef), B_batch: (size, coef, batch), summer over coef
-    if coef.dtype != x_eval.dtype:
-        coef = coef.to(x_eval.dtype)
-    ## In the torch.einsum, the k index is the batch sample index
-    if not repeated:
-        y_eval = torch.einsum(
-            "ij,ijk->ik", coef, B_batch(x_eval, grid, k, extend=extend)
-        )
-    else:
-        y_eval = torch.einsum(
-            "ij,ijk->ik", coef, B_batch_mod(x_eval, grid, k, extend=extend)
-        )
-    return y_eval
+    coef = coef.to(x_eval.dtype)
+    assert (
+        x_eval.device == grid.device == coef.device
+    ), f"x_eval device: {x_eval.device} != grid device: {grid.device} != coef device: {coef.device}"
+    basis_fn = B_batch_mod if repeated else B_batch
+    B = basis_fn(x_eval, grid, k=k, extend=extend)
+    return torch.einsum("ij,ijk->ik", coef, B)
 
 
-def der_coef2curve(x_eval, grid, coef, k):
-
-    # x_eval: (size, batch), grid: (size, grid), coef: (size, coef)
-    # coef: (size, coef), B_batch: (size, coef, batch), summer over coef
-    if coef.dtype != x_eval.dtype:
-        coef = coef.to(x_eval.dtype)
-    ## In the torch.einsum, the k index is the batch sample index
-    y_eval = torch.einsum("ij,ijk->ik", coef, der_B_batch(x_eval, grid, k))
-    return y_eval
+def der_coef2curve(x_eval: Tensor, grid: Tensor, coef: Tensor, k: int):
+    coef = coef.to(x_eval.dtype)
+    return torch.einsum("ij,ijk->ik", coef, der_B_batch(x_eval, grid, k))
 
 
-def der_coef2curve_coef(x_eval, grid, coef, k):
-
-    # x_eval: (size, batch), grid: (size, grid), coef: (size, coef)
-    # coef: (size, coef), B_batch: (size, coef, batch), summer over coef
-    if coef.dtype != x_eval.dtype:
-        coef = coef.to(x_eval.dtype)
-    ## Consider coef_new = coef[i+1]-coef[i]
+def der_coef2curve_coef(x_eval: Tensor, grid: Tensor, coef: Tensor, k: int):
     coef = coef[:, 1:] - coef[:, :-1]
-    ## In the torch.einsum, the k index is the batch sample index
-    ## Take out the last elment of the grid
     grid = grid[:, :-1]
-    y_eval = torch.einsum("ij,ijk->ik", coef, der_B_spline(x_eval, grid, k))
-    return y_eval
+    return torch.einsum("ij,ijk->ik", coef, der_B_spline(x_eval, grid, k))
 
 
-def curve2coef(x_eval, y_eval, grid, k, device="cpu"):
-    """
-    converting B-spline curves to B-spline coefficients using least squares.
+def curve2coef(x_eval: Tensor, y_eval: Tensor, grid: Tensor, k: int) -> Tensor:
+    """Convert B-spline curves to coefficients using least squares.
 
-    Args:
-    -----
-        x_eval : 2D torch.tensor
-            shape (number of splines, number of samples)
-        y_eval : 2D torch.tensor
-            shape (number of splines, number of samples)
-        grid : 2D torch.tensor
-            shape (number of splines, number of grid points)
-        k : int
-            the piecewise polynomial order of splines.
-        device : str
-            devicde
+    :param x_eval: Evaluation points
+    :type x_eval: torch.Tensor
+        Shape: (number_of_splines, number_of_samples)
+    :param y_eval: Curve values at evaluation points
+    :type y_eval: torch.Tensor
+        Shape: (number_of_splines, number_of_samples)
+    :param grid: Grid points for spline evaluation
+    :type grid: torch.Tensor
+        Shape: (number_of_splines, number_of_grid_points)
+    :param k: Order of the B-spline
+    :type k: int
+    :return: Computed B-spline coefficients
+    :rtype: torch.Tensor
+        Shape: (number_of_splines, number_of_coefficients)
+        Where number_of_coefficients = number_of_grid_points + k - 1
 
-    Example
-    -------
+    Example:
+    --------
+
     >>> num_spline = 5
     >>> num_sample = 100
     >>> num_grid_interval = 10
@@ -292,51 +347,112 @@ def curve2coef(x_eval, y_eval, grid, k, device="cpu"):
     >>> x_eval = torch.normal(0,1,size=(num_spline, num_sample))
     >>> y_eval = torch.normal(0,1,size=(num_spline, num_sample))
     >>> grids = torch.einsum('i,j->ij', torch.ones(num_spline,), torch.linspace(-1,1,steps=num_grid_interval+1))
+    >>> curve2coef(x_eval, y_eval, grids, k).shape
     torch.Size([5, 13])
     """
-    # x_eval: (size, batch); y_eval: (size, batch); grid: (size, grid); k: scalar
-    mat = B_batch(x_eval, grid, k).permute(0, 2, 1)
-    # coef = torch.linalg.lstsq(mat, y_eval.unsqueeze(dim=2)).solution[:, :, 0]
-    coef = torch.linalg.lstsq(
-        mat.to(device),
-        y_eval.unsqueeze(dim=2).to(device),
-        driver="gelsy" if device == "cpu" else "gels",
-    ).solution[:, :, 0]
-    return coef.to(device)
+    device = x_eval.device
+    b_batch = B_batch(x_eval, grid, k)
+    assert isinstance(b_batch, Tensor), "b_batch must be a Tensor"
+    mat = b_batch.permute(0, 2, 1)
+    y = y_eval.unsqueeze(dim=2)
+    solution = torch.linalg.lstsq(mat, y, driver="gelsy" if device == "cpu" else "gels")
+    return solution.solution[:, :, 0].to(device)
+
+
+# ========== Test ==========
 
 
 def _test_all():
     torch.manual_seed(42)
+    device = "cuda"
 
-    n, m, g, k = 4, 50, 8, 3
-    x_eval = torch.linspace(-1.2, 1.2, m).repeat(n, 1)
-    grid = torch.linspace(-1, 1, g + 1).repeat(n, 1)
-    coef = torch.randn((n, g + k))
-
+    # 1. Generate random data
+    data_range = (-3, 3)
+    n, m, g, k = 4, 50, 8, 2  # num_splines, num_samples, num_grid_interval, k
+    x_data = torch.linspace(data_range[0], data_range[1], m).repeat(n, 1).to(device=device)
+    
+    y_true = 2 * torch.sin(x_data) + 0.5 * x_data**2 - 0.1 * x_data**3 + torch.sqrt(x_data.abs())
+    y_true += 0.05 * torch.randn_like(y_true)  # Add noise
+    
+    # 2. Extend grid points
+    grid = torch.einsum(
+        "i,j->ij", torch.ones(n), torch.linspace(data_range[0], data_range[1], g + 1)
+    ).to(device)
+    extended_grid = extend_grid(grid, k_extend=k)
+    
+    # 3. Generate random B-spline coefficients
+    coef = torch.randn((n, g + k)).to(device=device)  # random fits
+    
+    # testing
     print(">> Testing B_batch...")
-    B = B_batch(x_eval, grid, k)
+    B = B_batch(x_data, grid, k)
+    assert isinstance(B, Tensor), "B must be a Tensor"
     print("Shape of B-spline basis:", B.shape)
 
     print(">> Testing coef2curve...")
-    y = coef2curve(x_eval, grid, coef, k)
+    y = coef2curve(x_data, grid, coef, k)
     print("Shape of curve output:", y.shape)
 
     print(">> Testing der_coef2curve...")
-    dy_dx = der_coef2curve(x_eval, grid, coef, k)
+    dy_dx = der_coef2curve(x_data, grid, coef, k)
     print("Shape of dy/dx:", dy_dx.shape)
 
     print(">> Testing der_coef2curve_coef...")
-    dy_dcoef = der_coef2curve_coef(x_eval, grid, coef, k)
+    dy_dcoef = der_coef2curve_coef(x_data, grid, coef, k)
     print("Shape of dy/dcoef:", dy_dcoef.shape)
 
     print(">> Testing curve2coef...")
-    coef_hat = curve2coef(x_eval, y, grid, k)
+    coef_hat = curve2coef(x_data, y, grid, k)
     print("Shape of recovered coef:", coef_hat.shape)
 
-    recon = coef2curve(x_eval, grid, coef_hat, k)
+    recon = coef2curve(x_data, grid, coef_hat, k)
     err = torch.norm(y - recon)
     print(f">> Reconstruction error: {err:.4e}")
+    
+    # 4. Fit B-spline coefficients with extended grid points
+    fitted_coef = curve2coef(x_data, y_true, grid, k=k)
+    fitted_curve = coef2curve(x_data, grid, fitted_coef, k=k)
 
-if __name__ =="__main__":
+    # 5. Visualization Results
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 6))
+
+    # Plot true curve
+    plt.plot(x_data[0].cpu(), y_true[0].cpu(), 'b-', alpha=0.6, linewidth=2, label='True Curve')
+
+    # Compute and plot individual Gaussian components
+    basis_functions = B_batch(x_data, grid, k=k, extend=True)
+    assert isinstance(basis_functions, Tensor), "basis_functions must be a Tensor"
+    num_basis = basis_functions.shape[1]
+
+    # Create color gradient for individual components
+    cmap = plt.get_cmap('viridis', num_basis)
+
+    # Plot each basis function scaled by its coefficient
+    components = torch.zeros_like(fitted_curve)
+    for i in range(num_basis):
+        component = fitted_coef[0, i] * basis_functions[0, i]
+        components[0] += component
+        plt.plot(x_data[0].cpu(), component.cpu(), '--', 
+                color=cmap(i/num_basis), alpha=0.6, 
+                label=f'Basis {i+1}' if i < 3 else None)  # Only label first few for clarity
+
+    # Plot the reconstructed curve
+    plt.plot(x_data[0].cpu(), fitted_curve[0].cpu(), 'r-', linewidth=2, alpha=0.6,
+            label='Reconstructed Curve (Sum of Basis Functions)')
+
+    # Plot grid points
+    plt.scatter(grid[0].cpu(), torch.zeros_like(grid[0].cpu()), 
+                c='g', s=100, marker='|', label='Grid Points')
+
+    plt.title(f"B-spline Fitting (k={k}, Grid Points={g+1})")
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.legend(loc='upper left', frameon=True)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
     _test_all()
-
