@@ -24,6 +24,7 @@ class KANLayer(nn.Module):
                  out_dim:int=2, 
                  num:int=5, 
                  k:int=3, 
+                 include_bias:bool=True,
                  grid_range: list[float]=[-1., 1.],
                  device:str | torch.device='cpu'
                  ):
@@ -37,6 +38,8 @@ class KANLayer(nn.Module):
         :type num: int, optional
         :param k: the piecewise polynomial order of splines, defaults to 3
         :type k: int, optional
+        :param include_bias: whether to include bias in each spline, defaults to True
+        :type include_bias: bool, optional
         :param grid_range: the range of grid points, defaults to [-1., 1.]
         :type grid_range: list[float], optional
         :param device: the device to run the model, defaults to 'cpu'
@@ -65,6 +68,31 @@ class KANLayer(nn.Module):
         noise_scale = 0.5
         noises = (torch.rand(self.num+1, self.in_dim, self.out_dim) - 1/2) * noise_scale / num
         self.coef = torch.nn.Parameter(curve2coef(self.grid[:,k:-k].permute(1,0), noises, self.grid, k))  # initialize coefficients to avoid zero and singularity issues
-
-        pass
+        
+        self.scale_sp = nn.Parameter(torch.ones(self.in_dim, self.out_dim) / np.sqrt(self.in_dim)).requires_grad_(True)
+        if include_bias:
+            self.scale_base = nn.Parameter(torch.rand(self.in_dim, self.out_dim)*2-1) * 1/np.sqrt(self.in_dim).requires_grad_(True)
+            self.base_fun = nn.SiLU()
+        else:
+            self.scale_base = None
+            self.base_fun = nn.Identity()
+        self.to(self.device)
+        return
     
+    def forward(self, x: torch.Tensor):
+        """Forward pass of the KANLayer
+
+        :param x: 2D torch.Tensor with shape (batch_size, in_dim)
+        :type x: torch.Tensor
+        
+        :return: 
+        :rtype: 
+        """
+        bs = x.shape[0]
+        
+        preacts = x[:, None, :].clone().expand(bs, self.out_dim, self.in_dim)
+        # preacts = x.repeat(bs, self.out_dim, 1)  # can I replace this with expand?
+        
+        base = self.base_fun(x)  # bs, in_dim
+        y = coef2curve(self.coef, self.grid, coef=self.coef, k=self.k)  # bs, num+1, out_dim
+        pass

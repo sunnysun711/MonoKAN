@@ -178,7 +178,7 @@ class KANLayer(nn.Module):
         preacts = x.permute(1, 0).clone().reshape(batch, self.out_dim, self.in_dim)
         base = self.base_fun(x).permute(1, 0)  # shape (batch, size)
         if not self.hermite:
-            y = coef2curve(x_eval=x, grid=self.grid[self.weight_sharing], coef=self.coef[self.weight_sharing], k=self.k, device=self.device)  # shape (size, batch)
+            y = coef2curve(x_eval=x, extended_grid=self.grid[self.weight_sharing], coef=self.coef[self.weight_sharing], k=self.k, device=self.device)  # shape (size, batch)
         #y = coef2curve(x_eval=x, grid=self.grid[self.weight_sharing],coef=self.coef[self.weight_sharing],repeated=True,k=self.k, device=self.device)  # shape (size, batch)
         elif self.hermite:
             y = coef2curve_hermite(x_eval=x, grid=self.grid[self.weight_sharing], coef=self.coef[self.weight_sharing], device=self.device)
