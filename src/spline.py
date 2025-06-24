@@ -71,7 +71,7 @@ def coef2curve(x_eval:torch.Tensor, extended_grid:torch.Tensor, coef:torch.Tenso
     >>> coef = torch.rand(n, out_dim, G+k)
     >>> y_eval = coef2curve(x_eval, extended_grid, coef, k=k)
     >>> y_eval.shape  # batch, in_dim, out_dim
-    torch.Size([100, 5, 2])   
+    torch.Size([100, 5, 2])
     """
     
     b_splines = B_batch(x_eval, extended_grid, k=k)
@@ -96,6 +96,7 @@ def curve2coef(x_eval:torch.Tensor, y_eval:torch.Tensor, extended_grid:torch.Ten
     :param k: the piecewise polynomial order of splines, defaults to 0
     :type k: int, optional
     
+    :raise RuntimeError: if least squares fails
     :return: coef, shape (in_dim, out_dim, G+k)
     :rtype: torch.Tensor
     
@@ -109,7 +110,7 @@ def curve2coef(x_eval:torch.Tensor, y_eval:torch.Tensor, extended_grid:torch.Ten
     >>> extended_grid = extend_grid(grid, k_extend=k)  # (n, G+2k+1)
     >>> coef = curve2coef(x_eval, y_eval, extended_grid, k=k)
     >>> coef.shape  # in_dim, out_dim, G+k
-    torch.Size([5, 2, 13]) 
+    torch.Size([5, 2, 13])
     """
     #print('haha', x_eval.shape, y_eval.shape, grid.shape)
     batch = x_eval.shape[0]
@@ -163,7 +164,7 @@ def extend_grid(grid:torch.Tensor, k_extend:int=0) -> torch.Tensor:
     >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(in_dim, 1)
     >>> extended_grid = extend_grid(grid, k_extend=k)
     >>> extended_grid.shape  # in_dim, G+2k+1
-    torch.Size([2, 17])  
+    torch.Size([2, 17])
     """
     h = (grid[:, [-1]] - grid[:, [0]]) / (grid.shape[1] - 1)
 

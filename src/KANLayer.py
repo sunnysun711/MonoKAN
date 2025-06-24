@@ -18,6 +18,8 @@ class KANLayer(nn.Module):
             the number of grid intervals
         k: int
             the piecewise polynomial order of splines
+        device: torch.device
+            the device to run the model
     """
     def __init__(self, 
                  in_dim:int=3, 
@@ -50,6 +52,7 @@ class KANLayer(nn.Module):
         
         Example
         -------
+        >>> from src.KANLayer import KANLayer
         >>> kan_layer = KANLayer(in_dim=3, out_dim=2, num=5, k=3, device='cuda')
         >>> kan_layer.in_dim, kan_layer.out_dim, kan_layer.num, kan_layer.k, kan_layer.device
         (3, 2, 5, 3, device(type='cuda'))
@@ -67,32 +70,59 @@ class KANLayer(nn.Module):
         
         noise_scale = 0.5
         noises = (torch.rand(self.num+1, self.in_dim, self.out_dim) - 1/2) * noise_scale / num
-        self.coef = torch.nn.Parameter(curve2coef(self.grid[:,k:-k].permute(1,0), noises, self.grid, k))  # initialize coefficients to avoid zero and singularity issues
+        # Initialize B-spline coefficients by fitting the (possibly noisy) curve values to the B-spline basis using least squares
+        self.coef = torch.nn.Parameter(curve2coef(self.grid[:,k:-k].permute(1,0), noises, self.grid, k))
         
         self.scale_sp = nn.Parameter(torch.ones(self.in_dim, self.out_dim) / np.sqrt(self.in_dim)).requires_grad_(True)
         if include_bias:
-            self.scale_base = nn.Parameter(torch.rand(self.in_dim, self.out_dim)*2-1) * 1/np.sqrt(self.in_dim).requires_grad_(True)
+            self.scale_base = nn.Parameter((torch.rand(self.in_dim, self.out_dim)*2-1) * 1/np.sqrt(self.in_dim)).requires_grad_(True)
             self.base_fun = nn.SiLU()
         else:
-            self.scale_base = None
+            self.scale_base = nn.Parameter(torch.zeros(self.in_dim, self.out_dim)).requires_grad_(False)
             self.base_fun = nn.Identity()
         self.to(self.device)
         return
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass of the KANLayer
 
         :param x: 2D torch.Tensor with shape (batch_size, in_dim)
         :type x: torch.Tensor
         
-        :return: 
-        :rtype: 
+        :return: a tuple of (y, preacts, postacts, postspline)
+
+            - y: outputs 
+                2D torch.Tensor with shape (batch_size, out_dim)
+            - preacts: fan out x into activations
+                3D torch.Tensor with shape (batch_size, out_dim, in_dim)
+            - postacts: 
+                3D torch.Tensor with shape (batch_size, out_dim, in_dim)
+            - postspline: 
+                3D torch.Tensor with shape (batch_size, out_dim, in_dim)
+        :rtype: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        
+        Example
+        -------
+        >>> from src.KANLayer import KANLayer, torch
+        >>> kan_layer = KANLayer(in_dim=3, out_dim=2, num=5, k=3, device='cpu')
+        >>> x = torch.rand(10, 3)  # batch_size=10, in_dim=3
+        >>> y, preacts, postacts, postspline = kan_layer(x)
+        >>> y.shape, preacts.shape, postacts.shape, postspline.shape
+        (torch.Size([10, 2]), torch.Size([10, 2, 3]), torch.Size([10, 2, 3]), torch.Size([10, 2, 3]))
         """
         bs = x.shape[0]
         
         preacts = x[:, None, :].clone().expand(bs, self.out_dim, self.in_dim)
         # preacts = x.repeat(bs, self.out_dim, 1)  # can I replace this with expand?
         
+        y = coef2curve(x, self.grid, coef=self.coef, k=self.k)  # bs, in_dim, out_dim
+        
+        postspline = y.clone().permute(0, 2, 1)  # bs, out_dim, in_dim
+        
         base = self.base_fun(x)  # bs, in_dim
-        y = coef2curve(self.coef, self.grid, coef=self.coef, k=self.k)  # bs, num+1, out_dim
-        pass
+        y = self.scale_base[None, :, :] * base[:, :, None] + self.scale_sp[None, :, :] * y
+        
+        postacts = y.clone().permute(0, 2, 1)  # bs, out_dim, in_dim
+        
+        y = torch.sum(y, dim=1)  # bs, in_dim
+        return y, preacts, postacts, postspline
