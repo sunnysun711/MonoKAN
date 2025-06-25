@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from src.spline import *
+from src.spline import extend_grid, curve2coef, coef2curve
+from src.utils import sparse_mask
 
 class KANLayer(nn.Module):
     """
@@ -26,7 +27,8 @@ class KANLayer(nn.Module):
                  out_dim:int=2, 
                  num:int=5, 
                  k:int=3, 
-                 include_bias:bool=True,
+                 include_basis:bool=True,
+                 sparse_init:bool=False,
                  grid_range: list[float]=[-1., 1.],
                  device:str | torch.device='cpu'
                  ):
@@ -40,8 +42,12 @@ class KANLayer(nn.Module):
         :type num: int, optional
         :param k: the piecewise polynomial order of splines, defaults to 3
         :type k: int, optional
-        :param include_bias: whether to include bias in each spline, defaults to True
-        :type include_bias: bool, optional
+        :param sparse_init: whether to initialize the coefficients with sparse mask, defaults to False.
+            If True, the coefficients will be initialized with a sparse mask, which can help to reduce the number of parameters.
+        :type sparse_init: bool, optional
+        :param include_basis: whether to include basis in each spline, defaults to True, including a linear basis in the output (instead of just the splines).
+            To speed up the convergence, it is recommended to include the basis.
+        :type include_basis: bool, optional
         :param grid_range: the range of grid points, defaults to [-1., 1.]
         :type grid_range: list[float], optional
         :param device: the device to run the model, defaults to 'cpu'
@@ -73,8 +79,13 @@ class KANLayer(nn.Module):
         # Initialize B-spline coefficients by fitting the (possibly noisy) curve values to the B-spline basis using least squares
         self.coef = torch.nn.Parameter(curve2coef(self.grid[:,k:-k].permute(1,0), noises, self.grid, k))
         
+        if sparse_init:
+            self.mask = torch.nn.Parameter(sparse_mask(in_dim, out_dim)).requires_grad_(False)
+        else:
+            self.mask = torch.nn.Parameter(torch.ones(in_dim, out_dim)).requires_grad_(False)
+        
         self.scale_sp = nn.Parameter(torch.ones(self.in_dim, self.out_dim) / np.sqrt(self.in_dim)).requires_grad_(True)
-        if include_bias:
+        if include_basis:
             self.scale_base = nn.Parameter((torch.rand(self.in_dim, self.out_dim)*2-1) * 1/np.sqrt(self.in_dim)).requires_grad_(True)
             self.base_fun = nn.SiLU()
         else:
@@ -113,7 +124,6 @@ class KANLayer(nn.Module):
         bs = x.shape[0]
         
         preacts = x[:, None, :].clone().expand(bs, self.out_dim, self.in_dim)
-        # preacts = x.repeat(bs, self.out_dim, 1)  # can I replace this with expand?
         
         y = coef2curve(x, self.grid, coef=self.coef, k=self.k)  # bs, in_dim, out_dim
         
@@ -121,8 +131,9 @@ class KANLayer(nn.Module):
         
         base = self.base_fun(x)  # bs, in_dim
         y = self.scale_base[None, :, :] * base[:, :, None] + self.scale_sp[None, :, :] * y
+        y = self.mask[None, :, :] * y
         
         postacts = y.clone().permute(0, 2, 1)  # bs, out_dim, in_dim
         
-        y = torch.sum(y, dim=1)  # bs, in_dim
+        y = torch.sum(y, dim=1)  # bs, out_dim
         return y, preacts, postacts, postspline
