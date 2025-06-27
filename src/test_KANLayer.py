@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
-from typing import Dict, List, Tuple
 
 # Assuming KANLayer is imported from your module
 # from src.KANLayer_temp import KANLayer
@@ -16,11 +15,13 @@ def true_func(x):
     y0 = 1.5 * x0 + torch.sin(2 * torch.pi * x1) - x2**3 + 0.5 * torch.sin(4 * x2)
     # y1: x0 ↑, x2 ↑ (with high-frequency oscillations, opposite direction to y0)
     y1 = 2.5 * x0 + torch.exp(x2) + 0.5 * torch.cos(4 * x2)
-    return torch.stack([y0, y1], dim=1)
+    res = torch.stack([y0, y1], dim=1)
+    res += torch.randn_like(res) * 0.05 - 0.025
+    return res
 
-def train_model(constraint_type: str, monotonic_dims_dirs: List[Tuple[int, int]], 
-                constraint_kwargs: Dict|None = None, max_epochs: int = 2000, 
-                patience: int = 20, verbose: bool = True) -> Tuple[nn.Module, List[float]]:
+def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]] | None, 
+                constraint_kwargs: dict | None = None, max_epochs: int = 2000, 
+                patience: int = 20, verbose: bool = True) -> tuple[nn.Module, list[float]]:
     """
     Train a KANLayer model with specified constraint type.
     
@@ -47,18 +48,26 @@ def train_model(constraint_type: str, monotonic_dims_dirs: List[Tuple[int, int]]
     if constraint_kwargs is None:
         constraint_kwargs = {}
     
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if verbose:
+        print(f"Using device: {device}")
+    
     # Generate training data
     torch.manual_seed(42)
     N = 10000
     x_train = torch.rand(N, 3) * 2 - 1  # uniform(-1, 1)
     y_train = true_func(x_train)
     
+    x_train = x_train.to(device)
+    y_train = y_train.to(device)
+    
     # Initialize model
     model = KANLayer(
         in_dim=3, out_dim=2, num=5, k=3,
         monotonic_dims_dirs=monotonic_dims_dirs,
         mono_cs_type=constraint_type,
-        include_basis=True
+        include_basis=True,
+        device=device
     )
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -96,21 +105,22 @@ def train_model(constraint_type: str, monotonic_dims_dirs: List[Tuple[int, int]]
     
     return model, loss_history
 
-def evaluate_monotonicity(model: KANLayer, constraint_kwargs: Dict |None= None) -> Dict:
+def evaluate_monotonicity(model: KANLayer, constraint_kwargs: dict |None= None) -> dict:
     """Evaluate monotonicity compliance of trained model."""
     if constraint_kwargs is None:
         constraint_kwargs = {}
     
     model.eval()
+    device = next(model.parameters()).device
     
     # Test monotonicity on a range of values
-    x_test = torch.linspace(-1, 1, 100)
+    x_test = torch.linspace(-1, 1, 100).to(device)
     results = {}
     
     for dim_idx, (dim, direction) in enumerate(model.monotonic_dims_dirs):
         for out_dim in range(model.out_dim):
             # Create test input varying only the target dimension
-            x_probe = torch.zeros(100, 3)
+            x_probe = torch.zeros(100, 3).to(device)
             x_probe[:, dim] = x_test
             
             with torch.no_grad():
@@ -118,7 +128,7 @@ def evaluate_monotonicity(model: KANLayer, constraint_kwargs: Dict |None= None) 
                 y_values = y_pred[:, out_dim]
             
             # Calculate differences
-            diffs = torch.diff(y_values)
+            diffs = torch.diff(y_values).cpu()
             
             # Check violations
             if direction == 1:  # should be increasing
@@ -140,14 +150,15 @@ def evaluate_monotonicity(model: KANLayer, constraint_kwargs: Dict |None= None) 
     
     return results
 
-def plot_comparison_results(models: Dict, constraint_kwargs_dict: Dict):
+def plot_comparison_results(models: dict, constraint_kwargs_dict: dict):
     """Plot comparison of different constraint types."""
     
     # Generate test data
-    x_plot = torch.linspace(-1, 1, 1000)
+    device = next(iter(models.values())).parameters().__next__().device  # GET DEVICE FROM MODEL
+    x_plot = torch.linspace(-1, 1, 1000).to(device)
     
     # Create figure
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 10))
     fig.suptitle('Monotonic Constraints Comparison', fontsize=16)
     
     # Colors for different constraint types
@@ -159,7 +170,7 @@ def plot_comparison_results(models: Dict, constraint_kwargs_dict: Dict):
             
             with torch.no_grad():
                 # Prepare probe input
-                x_probe = torch.zeros(1000, 3)
+                x_probe = torch.zeros(1000, 3).to(device)
                 x_probe[:, dim_idx] = x_plot
                 
                 # Get model predictions
@@ -168,12 +179,16 @@ def plot_comparison_results(models: Dict, constraint_kwargs_dict: Dict):
                 # Get ground truth
                 y_real = true_func(x_probe)
                 
+                x_plot_cpu = x_plot.cpu()
+                y_pred_cpu = y_pred.cpu()
+                y_real_cpu = y_real.cpu()
+                
                 # Plot y0 vs xi
                 ax = axes[0, dim_idx]
-                ax.plot(x_plot, y_pred[:, 0], color=colors[constraint_type], 
+                ax.plot(x_plot_cpu, y_pred_cpu[:, 0], color=colors[constraint_type], 
                        label=f'{constraint_type} (y0)', linewidth=2)
                 if constraint_type == 'strict':  # Only plot ground truth once
-                    ax.plot(x_plot, y_real[:, 0], '--', color='black', 
+                    ax.plot(x_plot_cpu, y_real_cpu[:, 0], '--', color='black', 
                            label='ground truth (y0)', alpha=0.7)
                 ax.set_title(f'y0 vs {dim_name}')
                 ax.grid(True, alpha=0.3)
@@ -181,10 +196,10 @@ def plot_comparison_results(models: Dict, constraint_kwargs_dict: Dict):
                 
                 # Plot y1 vs xi
                 ax = axes[1, dim_idx]
-                ax.plot(x_plot, y_pred[:, 1], color=colors[constraint_type], 
+                ax.plot(x_plot_cpu, y_pred_cpu[:, 1], color=colors[constraint_type], 
                        label=f'{constraint_type} (y1)', linewidth=2)
                 if constraint_type == 'strict':  # Only plot ground truth once
-                    ax.plot(x_plot, y_real[:, 1], '--', color='black', 
+                    ax.plot(x_plot_cpu, y_real_cpu[:, 1], '--', color='black', 
                            label='ground truth (y1)', alpha=0.7)
                 ax.set_title(f'y1 vs {dim_name}')
                 ax.grid(True, alpha=0.3)
@@ -192,12 +207,12 @@ def plot_comparison_results(models: Dict, constraint_kwargs_dict: Dict):
                 
                 # Plot differences (monotonicity check)
                 ax = axes[2, dim_idx]
-                diffs_y0 = torch.diff(y_pred[:, 0])
-                diffs_y1 = torch.diff(y_pred[:, 1])
+                diffs_y0 = torch.diff(y_pred_cpu[:, 0])
+                diffs_y1 = torch.diff(y_pred_cpu[:, 1])
                 
-                ax.plot(x_plot[1:], diffs_y0, color=colors[constraint_type], 
+                ax.plot(x_plot_cpu[1:], diffs_y0, color=colors[constraint_type], 
                        alpha=0.7, label=f'{constraint_type} (dy0/d{dim_name})')
-                ax.plot(x_plot[1:], diffs_y1, color=colors[constraint_type], 
+                ax.plot(x_plot_cpu[1:], diffs_y1, color=colors[constraint_type], 
                        linestyle=':', alpha=0.7, label=f'{constraint_type} (dy1/d{dim_name})')
                 ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
                 ax.set_title(f'Derivatives d/d{dim_name}')
@@ -217,8 +232,8 @@ def run_monotonic_constraints_comparison():
     
     constraint_configs = {
         'strict': {},
-        'soft': {'elu_alpha': 0.05},
-        'segment': {'violation_segments': 0.3}
+        'soft': {'elu_alpha': 0.04},
+        'segment': {'violation_segments': 0.1}
     }
     
     # Train models with different constraint types
@@ -231,7 +246,8 @@ def run_monotonic_constraints_comparison():
             constraint_type=constraint_type,
             monotonic_dims_dirs=monotonic_dims_dirs,
             constraint_kwargs=constraint_kwargs,
-            verbose=True
+            verbose=True,
+            max_epochs=2500,
         )
         models[constraint_type] = model
         loss_histories[constraint_type] = loss_history

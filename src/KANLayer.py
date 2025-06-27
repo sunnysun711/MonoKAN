@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from src.spline import extend_grid, curve2coef, coef2curve
+from src.spline import extend_grid, curve2coef, coef2curve, B_batch
 from src.utils import sparse_mask
 
 class KANLayer(nn.Module):
@@ -585,7 +585,7 @@ class KANLayer(nn.Module):
         
         postspline = y.clone().permute(0, 2, 1)  # bs, out_dim, in_dim
         
-        scale_sp = torch.nn.functional.softplus(self.scale_sp_raw)
+        scale_sp = torch.nn.functional.softplus(self.scale_sp_raw)  # in_dim, out_dim
         y = scale_sp[None, :, :] * y
         
         if self.include_basis:
@@ -613,6 +613,87 @@ class KANLayer(nn.Module):
         #     print("coef of x2 (after softplus+cumsum):", coef[2])
         
         return y, preacts, postacts, postspline
+    
+    
+    def regularization_loss(self, x: torch.Tensor, regularize_activation: float = 1.0, regularize_entropy: float = 1.0) -> torch.Tensor:
+        """
+        NOTE: NOT TESTED YET.
+        """
+        with torch.no_grad():
+            b_splines = B_batch(x, self.grid, k=self.k)
+            
+            # 应用约束后的系数
+            coef = self.coef.clone()
+            if self.mono_cs_type == 'strict':
+                coef = self._apply_strict_monotonic(coef)
+            elif self.mono_cs_type == 'soft':
+                coef = self._apply_soft_monotonic(coef)
+            
+            # 计算激活输出
+            spline_outputs = torch.einsum('bik,jok->bjo', b_splines, coef)
+        
+        # 1. 激活值L1正则化
+        activation_l1 = torch.abs(spline_outputs).mean()
+        
+        # 2. 权重L1正则化
+        weight_l1 = torch.abs(self.coef).mean()
+        
+        # 3. 熵正则化
+        activation_strength = torch.abs(spline_outputs).mean(dim=0)  # (out_dim, in_dim)
+        activation_strength = activation_strength / (activation_strength.sum(dim=1, keepdim=True) + 1e-8)
+        entropy_reg = -(activation_strength * torch.log(activation_strength + 1e-8)).sum()
+        
+        return regularize_activation * (activation_l1 + weight_l1) - regularize_entropy * entropy_reg
+
+    def update_grid(self, x: torch.Tensor, margin: float = 0.01):
+        """
+        NOTE: NOT TESTED YET.
+        """
+        assert x.dim() == 2 and x.size(1) == self.in_dim
+        batch = x.size(0)
+        
+        # 计算当前输出
+        with torch.no_grad():
+            splines = B_batch(x, self.grid, k=self.k)
+            
+            # 获取当前系数
+            coef = self.coef.clone()
+            if self.mono_cs_type == 'strict':
+                coef = self._apply_strict_monotonic(coef)
+            elif self.mono_cs_type == 'soft':
+                coef = self._apply_soft_monotonic(coef)
+            
+            # 计算未约简的样条输出
+            unreduced_output = torch.einsum('bik,jok->bijo', splines, coef)
+        
+        # 按通道排序收集数据分布
+        x_sorted = torch.sort(x, dim=0)[0]
+        grid_adaptive = x_sorted[
+            torch.linspace(0, batch - 1, self.num + 1, dtype=torch.int64, device=x.device)
+        ]
+        
+        uniform_step = (x_sorted[-1] - x_sorted[0] + 2 * margin) / self.num
+        grid_uniform = (
+            torch.arange(self.num + 1, dtype=torch.float32, device=x.device).unsqueeze(1)
+            * uniform_step + x_sorted[0] - margin
+        )
+        
+        # 混合自适应和均匀网格
+        grid_eps = 0.02
+        grid = grid_eps * grid_uniform + (1 - grid_eps) * grid_adaptive
+        
+        # 扩展网格
+        grid = torch.concatenate([
+            grid[:1] - uniform_step * torch.arange(self.k, 0, -1, device=x.device).unsqueeze(1),
+            grid,
+            grid[-1:] + uniform_step * torch.arange(1, self.k + 1, device=x.device).unsqueeze(1),
+        ], dim=0)
+        
+        # 更新网格和系数
+        self.grid.copy_(grid.T)
+        # 重新拟合系数
+        new_coef = curve2coef(x, unreduced_output.mean(dim=3).permute(0, 2, 1), self.grid, self.k)
+        self.coef.data.copy_(new_coef)
     
     def get_eval_coefficients(self, return_effective: bool = False, **constraint_kwargs) -> dict[str, torch.Tensor]:
         """
