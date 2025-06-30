@@ -19,6 +19,25 @@ def true_func(x):
     res += torch.randn_like(res) * 0.05 - 0.025
     return res
 
+def true_func_derivatives(x):
+    """Calculate true derivatives of the ground truth function."""
+    x0, x1, x2 = x[:, 0], x[:, 1], x[:, 2]
+    
+    # dy0/dx derivatives
+    dy0_dx0 = torch.ones_like(x0) * 1.5  # constant
+    dy0_dx1 = 2 * torch.pi * torch.cos(2 * torch.pi * x1)  # oscillating
+    dy0_dx2 = -3 * x2**2 + 0.5 * 4 * torch.cos(4 * x2)  # decreasing trend + oscillation
+    
+    # dy1/dx derivatives  
+    dy1_dx0 = torch.ones_like(x0) * 2.5  # constant
+    dy1_dx1 = torch.zeros_like(x1)  # no x1 dependence in y1
+    dy1_dx2 = torch.exp(x2) + 0.5 * (-4) * torch.sin(4 * x2)  # increasing trend + oscillation
+    
+    return {
+        'dy0': [dy0_dx0, dy0_dx1, dy0_dx2],
+        'dy1': [dy1_dx0, dy1_dx1, dy1_dx2]
+    }
+
 def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]] | None, 
                 constraint_kwargs: dict | None = None, max_epochs: int = 2000, 
                 patience: int = 20, verbose: bool = True) -> tuple[nn.Module, list[float]]:
@@ -28,7 +47,7 @@ def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]]
     Parameters
     ----------
     constraint_type : str
-        Type of monotonic constraint ('strict', 'soft', 'segment').
+        Type of monotonic constraint ('strict', 'soft', 'unconstrained').
     monotonic_dims_dirs : list
         Monotonic dimensions and directions.
     constraint_kwargs : dict, optional
@@ -61,14 +80,25 @@ def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]]
     x_train = x_train.to(device)
     y_train = y_train.to(device)
     
+    G = 10
+    
     # Initialize model
-    model = KANLayer(
-        in_dim=3, out_dim=2, num=5, k=3,
-        monotonic_dims_dirs=monotonic_dims_dirs,
-        mono_cs_type=constraint_type,
-        include_basis=True,
-        device=device
-    )
+    if constraint_type == "unconstrained":
+        model = KANLayer(
+            in_dim=3, out_dim=2, num=G, k=3,
+            monotonic_dims_dirs=None,
+            include_basis=True,
+            device=device
+        )
+    else:
+        model = KANLayer(
+            in_dim=3, out_dim=2, num=G, k=3,
+            monotonic_dims_dirs=monotonic_dims_dirs,
+            mono_cs_type=constraint_type,
+            include_basis=True,
+            device=device,
+            **constraint_kwargs  # Pass constraint_kwargs here
+        )
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     loss_fn = nn.MSELoss()
@@ -80,7 +110,7 @@ def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]]
     
     for epoch in range(max_epochs):
         model.train()
-        y_pred, *_ = model(x_train, **constraint_kwargs)
+        y_pred, *_ = model(x_train)
         loss = loss_fn(y_pred, y_train)
         
         optimizer.zero_grad()
@@ -105,11 +135,8 @@ def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]]
     
     return model, loss_history
 
-def evaluate_monotonicity(model: KANLayer, constraint_kwargs: dict |None= None) -> dict:
+def evaluate_monotonicity(model: KANLayer) -> dict:
     """Evaluate monotonicity compliance of trained model."""
-    if constraint_kwargs is None:
-        constraint_kwargs = {}
-    
     model.eval()
     device = next(model.parameters()).device
     
@@ -124,7 +151,7 @@ def evaluate_monotonicity(model: KANLayer, constraint_kwargs: dict |None= None) 
             x_probe[:, dim] = x_test
             
             with torch.no_grad():
-                y_pred, *_ = model(x_probe, **constraint_kwargs)
+                y_pred, *_ = model(x_probe)
                 y_values = y_pred[:, out_dim]
             
             # Calculate differences
@@ -162,19 +189,20 @@ def plot_comparison_results(models: dict, constraint_kwargs_dict: dict):
     fig.suptitle('Monotonic Constraints Comparison', fontsize=16)
     
     # Colors for different constraint types
-    colors = {'strict': 'red', 'soft': 'blue', 'segment': 'green'}
+    colors = {'strict': 'red', 'soft': 'blue', 'unconstrained': 'green'}
     
     for dim_idx, dim_name in enumerate(['x0', 'x1', 'x2']):
+        # Prepare probe input for this dimension
+        x_probe = torch.zeros(1000, 3).to(device)
+        x_probe[:, dim_idx] = x_plot
+        
+        # Get true derivatives
+        true_derivs = true_func_derivatives(x_probe)
+        
         for constraint_type, model in models.items():
-            constraint_kwargs = constraint_kwargs_dict.get(constraint_type, {})
-            
             with torch.no_grad():
-                # Prepare probe input
-                x_probe = torch.zeros(1000, 3).to(device)
-                x_probe[:, dim_idx] = x_plot
-                
                 # Get model predictions
-                y_pred, *_ = model(x_probe, **constraint_kwargs)
+                y_pred, *_ = model(x_probe)
                 
                 # Get ground truth
                 y_real = true_func(x_probe)
@@ -207,13 +235,25 @@ def plot_comparison_results(models: dict, constraint_kwargs_dict: dict):
                 
                 # Plot differences (monotonicity check)
                 ax = axes[2, dim_idx]
-                diffs_y0 = torch.diff(y_pred_cpu[:, 0])
-                diffs_y1 = torch.diff(y_pred_cpu[:, 1])
+                # Calculate proper derivatives: dy/dx = diff(y) / diff(x)
+                dx = torch.diff(x_plot_cpu)  # x step size
+                diffs_y0 = torch.diff(y_pred_cpu[:, 0]) / dx
+                diffs_y1 = torch.diff(y_pred_cpu[:, 1]) / dx
                 
                 ax.plot(x_plot_cpu[1:], diffs_y0, color=colors[constraint_type], 
                        alpha=0.7, label=f'{constraint_type} (dy0/d{dim_name})')
                 ax.plot(x_plot_cpu[1:], diffs_y1, color=colors[constraint_type], 
                        linestyle=':', alpha=0.7, label=f'{constraint_type} (dy1/d{dim_name})')
+                
+                # Plot true derivatives (only once)
+                if constraint_type == 'strict':
+                    true_dy0 = true_derivs['dy0'][dim_idx].cpu()
+                    true_dy1 = true_derivs['dy1'][dim_idx].cpu()
+                    ax.plot(x_plot_cpu, true_dy0, '--', color='black', 
+                           alpha=0.5, label=f'true dy0/d{dim_name}')
+                    ax.plot(x_plot_cpu, true_dy1, ':', color='black', 
+                           alpha=0.5, label=f'true dy1/d{dim_name}')
+                
                 ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)
                 ax.set_title(f'Derivatives d/d{dim_name}')
                 ax.grid(True, alpha=0.3)
@@ -232,8 +272,8 @@ def run_monotonic_constraints_comparison():
     
     constraint_configs = {
         'strict': {},
-        'soft': {'elu_alpha': 0.04},
-        'segment': {'violation_segments': 0.1}
+        'soft': {'elu_alpha': 0.02},
+        'unconstrained': {}
     }
     
     # Train models with different constraint types
@@ -247,7 +287,7 @@ def run_monotonic_constraints_comparison():
             monotonic_dims_dirs=monotonic_dims_dirs,
             constraint_kwargs=constraint_kwargs,
             verbose=True,
-            max_epochs=2500,
+            max_epochs=6000,
         )
         models[constraint_type] = model
         loss_histories[constraint_type] = loss_history
@@ -258,8 +298,7 @@ def run_monotonic_constraints_comparison():
     compliance_results = {}
     
     for constraint_type, model in models.items():
-        constraint_kwargs = constraint_configs[constraint_type]
-        compliance = evaluate_monotonicity(model, constraint_kwargs)
+        compliance = evaluate_monotonicity(model)
         compliance_results[constraint_type] = compliance
         
         print(f"\n{constraint_type.upper()} Constraints:")
@@ -285,13 +324,12 @@ def run_monotonic_constraints_comparison():
     # Analyze coefficient differences
     print("\n=== Coefficient Analysis ===")
     for constraint_type, model in models.items():
-        constraint_kwargs = constraint_configs[constraint_type]
-        coef_info = model.get_eval_coefficients(return_effective=True, **constraint_kwargs)
+        coef_info = model.get_eval_coefficients()  # Remove return_effective and constraint_kwargs
         
         print(f"\n{constraint_type.upper()} Constraints:")
         print(f"  Raw coef range: [{coef_info['raw_coef'].min():.3f}, {coef_info['raw_coef'].max():.3f}]")
         print(f"  Constrained coef range: [{coef_info['constrained_coef'].min():.3f}, {coef_info['constrained_coef'].max():.3f}]")
-        if 'effective_coef' in coef_info:
+        if coef_info['effective_coef'] is not None:  # Check if not None instead of key existence
             print(f"  Effective coef range: [{coef_info['effective_coef'].min():.3f}, {coef_info['effective_coef'].max():.3f}]")
     
     return models, compliance_results, loss_histories
@@ -302,14 +340,14 @@ if __name__ == "__main__":
     models, compliance_results, loss_histories = run_monotonic_constraints_comparison()
     
     print("\n=== Summary ===")
-    print("The test compares three monotonicity constraint types:")
-    print("- STRICT: Hard constraints using cumsum(softplus())")
-    print("- SOFT: Tolerance-based constraints allowing minor violations")
-    print("- SEGMENT: Allows violations in specified proportion of segments")
+    print("The test compares three model types:")
+    print("- STRICT: Hard monotonic constraints using cumsum(softplus())")
+    print("- SOFT: Soft constraints allowing minor violations with ELU")
+    print("- UNCONSTRAINED: No monotonic constraints (baseline)")
     print("\nExpected behavior:")
-    print("- x0 should show increasing trend (monotonic_dims_dirs contains (0, 1))")
-    print("- x1 should show natural oscillations (no constraints)")
-    print("- x2 should show decreasing trend (monotonic_dims_dirs contains (2, -1))")
-    print("\nStrict constraints should show the best compliance but potentially worse fit.")
+    print("- x0 should show increasing trend for constrained models")
+    print("- x1 should show natural oscillations (no constraints for all)")
+    print("- x2 should show decreasing trend for constrained models")
+    print("\nStrict constraints should show best compliance but potentially worse fit.")
     print("Soft constraints should balance compliance and flexibility.")
-    print("Segment constraints should allow controlled violations for better fit.")
+    print("Unconstrained should show best fit but no monotonic compliance.")

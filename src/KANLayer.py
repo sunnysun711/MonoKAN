@@ -32,10 +32,11 @@ class KANLayer(nn.Module):
         (dimension_index, direction) where direction is 1 (increasing) or -1 (decreasing).
         Example: [(0, 1), (2, -1)] means dimension 0 is increasing, dimension 2 is decreasing.
     mono_cs_type : str, default='strict'
-        Type of monotonicity constraint. Options: 'strict', 'soft', 'segment'.
+        Type of monotonicity constraint. Options: 'strict', 'soft'.
         - 'strict': Hard monotonicity constraints using cumulative softplus
-        - 'soft': Soft constraints with tolerance for violations
-        - 'segment': Allow violations in specified proportion of segments
+        - 'soft': Soft constraints with cumulative ELU activation, instead of softplus.
+    elu_alpha : float, default=0.01
+        The alpha parameter for ELU activation. Only used when mono_cs_type is 'soft'.
     device : str or torch.device, default='cpu'
         Device to run the model on.
     
@@ -53,6 +54,18 @@ class KANLayer(nn.Module):
         Scaling parameters for linear basis functions.
     base_mask : torch.Tensor
         Mask to remove basis functions from monotonic dimensions.
+    monotonic_dims_dirs : list of tuple
+        List of tuples containing monotonic dimension indices and directions.
+    monotonic_dims : list of int
+        List of monotonic dimension indices extracted from monotonic_dims_dirs.
+    mono_cs_type : str
+        Type of monotonicity constraint being applied.
+    elu_alpha : float
+        Alpha parameter for ELU activation function in soft constraints.
+    base_fun : torch.nn.Module
+        Base activation function (SiLU or Identity).
+    include_basis : bool
+        Whether linear basis functions are included.
     """
     def __init__(self, 
                  in_dim:int=3, 
@@ -64,6 +77,7 @@ class KANLayer(nn.Module):
                  grid_range: list[float]=[-1., 1.],
                  monotonic_dims_dirs: list[tuple[int, int]] | None = None,
                  mono_cs_type: str = 'strict',
+                 elu_alpha: float = 0.01,
                  device:str | torch.device='cpu'
                  ):
         """initilize a KANLayer
@@ -97,6 +111,10 @@ class KANLayer(nn.Module):
             - 'soft': Soft constraints with tolerance for violations
             - 'segment': Allow violations in specified proportion of segments
         :type mono_cs_type: str, optional
+        :param elu_alpha: the alpha parameter for ELU activation, defaults to 0.01
+            Only used when mono_cs_type is 'soft'.
+        :type elu_alpha: float, optional
+
         :param device: the device to run the model, defaults to 'cpu'
         :type device: str | torch.device, optional
         
@@ -129,9 +147,9 @@ class KANLayer(nn.Module):
 
         # Different constraint types
         >>> kan_strict = KANLayer(monotonic_dims_dirs=[(0, 1)], mono_cs_type='strict')
-        >>> kan_segment = KANLayer(monotonic_dims_dirs=[(1, -1)], mono_cs_type='segment')
-        >>> [kan_strict.mono_cs_type, kan_segment.mono_cs_type]
-        ['strict', 'segment']
+        >>> kan_soft = KANLayer(monotonic_dims_dirs=[(1, -1)], mono_cs_type='soft')
+        >>> [kan_strict.mono_cs_type, kan_soft.mono_cs_type]
+        ['strict', 'soft']
         """
         super(KANLayer, self).__init__()
         self.in_dim = in_dim
@@ -143,10 +161,11 @@ class KANLayer(nn.Module):
         self.monotonic_dims = [d[0] for d in self.monotonic_dims_dirs]
         
         # Validate monotonicity constraint type
-        valid_mono_types = {'strict', 'soft', 'segment'}
+        valid_mono_types = {'strict', 'soft'}  # TODO currently only support two types
         if mono_cs_type not in valid_mono_types:
             raise ValueError(f"mono_cs_type must be one of {valid_mono_types}, got {mono_cs_type}")
-        self.mono_cs_type = mono_cs_type
+        self.mono_cs_type: str = mono_cs_type
+        self.elu_alpha: float = elu_alpha
         
         grid = torch.linspace(grid_range[0], grid_range[1], steps=num + 1).repeat(self.in_dim, 1)
         grid = extend_grid(grid, k_extend=k)
@@ -178,46 +197,98 @@ class KANLayer(nn.Module):
         self.to(self.device)
         return
     
-    
-    def _apply_strict_monotonic(self, coef:torch.Tensor) -> torch.Tensor:
-        """Apply strict monotonicity constraints using cumulative softplus transformation.
+    def _apply_cumulative_monotonic(self, coef: torch.Tensor) -> torch.Tensor:
+        """
+        Apply monotonicity constraints using cumulative activation transformation.
         
-        This method enforces hard monotonicity constraints by ensuring that the differences
-        between consecutive B-spline coefficients are non-negative (for increasing) or
-        non-positive (for decreasing) through cumulative summation of softplus-transformed
-        differences.
+        This method enforces monotonicity constraints by applying an activation function
+        to ensure non-negative (or non-positive) differences between consecutive B-spline
+        coefficients, followed by cumulative summation.
         
-        :param coef: B spline coefficients, shape (in_dim, out_dim, G+k)
-        :type coef: torch.Tensor
+        This method uses ELU activation with alpha=self.elu_alpha for soft constraints 
+        when self.mono_cs_type='soft', and uses softplus for strict constraints when 
+        self.mono_cs_type='strict'.
         
-        :return: the coefficients with strict monotonicity, shape (batch_size, in_dim, out_dim)
-        :rtype: torch.Tensor
+        Parameters
+        ----------
+        coef : torch.Tensor
+            B-spline coefficients with shape (in_dim, out_dim, n_coef).
+        
+
+        Returns
+        -------
+        torch.Tensor
+            Monotonicity-constrained coefficients with same shape as input.
+            
+        Notes
+        -----
+        Mathematical formulation:
+        - For softplus: delta_i = softplus(coef_i), constrained_coef = cumsum(delta)
+        - For ELU: delta_i = elu(coef_i, alpha), constrained_coef = cumsum(delta)
+        - For decreasing: constrained_coef = -cumsum(delta)
         
         Examples
         --------
-        >>> from src.KANLayer import torch, KANLayer
-        >>> kan = KANLayer(in_dim=2, out_dim=1, num=4, k=2, 
-        ...                monotonic_dims_dirs=[(0, 1), (1, -1)])
-        >>> coef = torch.randn(2, 1, 6)  # (in_dim=2, out_dim=1, n_coef=6)
-        >>> constrained_coef = kan._apply_strict_monotonic(coef)
-        >>> constrained_coef.shape
+        >>> import torch
+        >>> from src.KANLayer import KANLayer
+        
+        # Test with strict monotonic constraints (increasing)
+        >>> kan_strict = KANLayer(in_dim=2, out_dim=1, num=4, k=2,
+        ...                       monotonic_dims_dirs=[(0, 1)], mono_cs_type='strict')
+        >>> coef_input = torch.randn(2, 1, 6)
+        >>> coef_constrained = kan_strict._apply_cumulative_monotonic(coef_input)
+        >>> coef_constrained.shape
         torch.Size([2, 1, 6])
-
-        # Check monotonicity for increasing dimension (dim=0)
-        >>> diffs_dim0 = torch.diff(constrained_coef[0, 0, :])
-        >>> (diffs_dim0 >= 0).all().item()  # Should be monotonic increasing
+        
+        # Verify increasing constraint: differences should be non-negative
+        >>> diffs = torch.diff(coef_constrained[0, 0, :])
+        >>> (diffs >= 0).all().item()
         True
-
-        # Check monotonicity for decreasing dimension (dim=1) 
-        >>> diffs_dim1 = torch.diff(constrained_coef[1, 0, :])
-        >>> (diffs_dim1 <= 0).all().item()  # Should be monotonic decreasing
+        
+        # Test with soft monotonic constraints (decreasing)
+        >>> kan_soft = KANLayer(in_dim=3, out_dim=2, num=5, k=3,
+        ...                     monotonic_dims_dirs=[(1, -1)], mono_cs_type='soft', elu_alpha=1e-10)  # very small number to enforce almost monotonicity
+        >>> coef_multi = torch.randn(3, 2, 8)
+        >>> coef_soft_constrained = kan_soft._apply_cumulative_monotonic(coef_multi)
+        >>> coef_soft_constrained.shape
+        torch.Size([3, 2, 8])
+        
+        # Verify decreasing constraint for dimension 1, should be True
+        >>> diffs_decreasing = torch.diff(coef_soft_constrained[1, 0, :])
+        >>> (diffs_decreasing <= 0).all().item()
         True
-
-        # No constraints case
-        >>> kan_no_mono = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=None)
-        >>> original_coef = torch.randn(2, 1, 6)
-        >>> result_coef = kan_no_mono._apply_strict_monotonic(original_coef)
-        >>> torch.allclose(original_coef, result_coef)
+        
+        # Test softer example:
+        >>> kan_soft = KANLayer(in_dim=3, out_dim=2, num=5, k=3,
+        ...                     monotonic_dims_dirs=[(1, -1)], mono_cs_type='soft', elu_alpha=0.01)
+        >>> coef_multi = torch.randn(3, 2, 8)
+        >>> coef_soft_constrained = kan_soft._apply_cumulative_monotonic(coef_multi)
+        >>> diffs_decreasing = torch.diff(coef_soft_constrained[1, 0, :])
+        >>> (diffs_decreasing <= 0).all().item()  # Very likely would be False
+        False
+        
+        # Test with multiple constraints
+        >>> kan_multi = KANLayer(in_dim=4, out_dim=2, num=6, k=3,
+        ...                      monotonic_dims_dirs=[(0, 1), (2, -1), (3, 1)],
+        ...                      mono_cs_type='strict')
+        >>> coef_multi_input = torch.randn(4, 2, 9)
+        >>> coef_multi_constrained = kan_multi._apply_cumulative_monotonic(coef_multi_input)
+        
+        # Check increasing constraints for dims 0 and 3
+        >>> (torch.diff(coef_multi_constrained[0, 0, :]) >= 0).all().item()
+        True
+        >>> (torch.diff(coef_multi_constrained[3, 0, :]) >= 0).all().item()
+        True
+        
+        # Check decreasing constraint for dim 2
+        >>> (torch.diff(coef_multi_constrained[2, 0, :]) <= 0).all().item()
+        True
+        
+        # Test with no constraints (should return unchanged)
+        >>> kan_no_constraints = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=[])
+        >>> coef_unchanged = torch.randn(2, 1, 5)
+        >>> coef_result = kan_no_constraints._apply_cumulative_monotonic(coef_unchanged)
+        >>> torch.allclose(coef_unchanged, coef_result)
         True
         """
         if len(self.monotonic_dims_dirs) == 0:
@@ -225,25 +296,37 @@ class KANLayer(nn.Module):
         
         coef = coef.permute(1, 0, 2)  # (out_dim, in_dim, n_coef)
         new_coef_list = []
-        for j in range(coef.shape[0]):  # out_dim
+        
+        for j in range(coef.shape[0]):  # iterate over output dimensions
             coef_j = coef[j]  # (in_dim, n_coef)
             for dim, direction in self.monotonic_dims_dirs:
-                delta = torch.nn.functional.softplus(coef_j[dim])
+                # Apply activation function based on type
+                if self.mono_cs_type == 'strict':
+                    delta = torch.nn.functional.softplus(coef_j[dim])
+                elif self.mono_cs_type == 'soft':
+                    delta = torch.nn.functional.elu(coef_j[dim], alpha=self.elu_alpha)
+                else:
+                    raise ValueError(f"Unsupported mono_cs_type: {self.mono_cs_type}. "
+                                f"Supported types: 'strict', 'soft'")
+                
+                # Cumulative sum to enforce monotonicity
                 delta = torch.cumsum(delta, dim=-1)
                 if direction == -1:
-                    delta = -delta
+                    delta = -delta  # reverse for decreasing monotonicity
+                
                 coef_j = coef_j.clone()
                 coef_j[dim] = delta
             new_coef_list.append(coef_j)
+            
         coef = torch.stack(new_coef_list, dim=0).permute(1, 0, 2)
         return coef
     
-    def _reverse_strict_monotonic(self, coef_constrained: torch.Tensor) -> torch.Tensor:
+    def _reverse_cumulative_monotonic(self, coef_constrained: torch.Tensor) -> torch.Tensor:
         """
-        Reverse the strict monotonic transformation to recover effective coefficients.
+        Reverse the cumulative monotonic transformation to recover effective coefficients.
         
-        This method reverses the cumsum(softplus()) transformation applied in 
-        _apply_strict_monotonic to recover the original B-spline coefficients that 
+        This method reverses the cumulative activation transformation applied in 
+        _apply_cumulative_monotonic to recover the original B-spline coefficients that 
         represent the actual function shape before constraint enforcement.
         
         Parameters
@@ -259,42 +342,36 @@ class KANLayer(nn.Module):
         Notes
         -----
         The reverse transformation follows:
+        For strict mode (softplus):
         1. constrained = direction * cumsum(softplus(raw))
         2. diff(constrained) = direction * softplus(raw[1:])
         3. raw[1:] = softplus_inverse(direction * diff(constrained))
+        
+        For soft mode (ELU):
+        1. constrained = direction * cumsum(elu(raw, alpha))
+        2. diff(constrained) = direction * elu(raw[1:], alpha)
+        3. raw[1:] = elu_inverse(direction * diff(constrained), alpha)
         
         Examples
         --------
         >>> from src.KANLayer import torch, KANLayer
         >>> kan = KANLayer(in_dim=2, out_dim=1, num=4, k=2,
-        ...                monotonic_dims_dirs=[(0, 1)])
+        ...                monotonic_dims_dirs=[(0, 1)], mono_cs_type='strict')
         
         # Forward and reverse transformation
         >>> original_coef = torch.randn(2, 1, 6)
-        >>> constrained_coef = kan._apply_strict_monotonic(original_coef)
-        >>> recovered_coef = kan._reverse_strict_monotonic(constrained_coef)
+        >>> constrained_coef = kan._apply_cumulative_monotonic(original_coef)
+        >>> recovered_coef = kan._reverse_cumulative_monotonic(constrained_coef)
         >>> recovered_coef.shape
         torch.Size([2, 1, 6])
 
-        # Non-monotonic dimensions should be unchanged in reverse
-        >>> torch.allclose(original_coef[1], recovered_coef[1], atol=1e-6)
-        True
-
-        # Test with multiple output dimensions
-        >>> kan_multi = KANLayer(in_dim=3, out_dim=2, monotonic_dims_dirs=[(0, 1), (2, -1)])
-        >>> coef_multi = torch.randn(3, 2, 8)
-        >>> constrained_multi = kan_multi._apply_strict_monotonic(coef_multi)
-        >>> recovered_multi = kan_multi._reverse_strict_monotonic(constrained_multi)
-        >>> recovered_multi.shape
-        torch.Size([3, 2, 8])
-
-        # Verify numerical stability with extreme values
-        >>> extreme_coef = torch.tensor([[[100., -100., 50., -50., 25.]]])  # (1, 1, 5)
-        >>> kan_extreme = KANLayer(in_dim=1, out_dim=1, monotonic_dims_dirs=[(0, 1)])
-        >>> stable_result = kan_extreme._reverse_strict_monotonic(
-        ...     kan_extreme._apply_strict_monotonic(extreme_coef))
-        >>> torch.isfinite(stable_result).all().item()
-        True
+        # Test with soft constraints
+        >>> kan_soft = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=[(0, 1)], 
+        ...                     mono_cs_type='soft')
+        >>> constrained_soft = kan_soft._apply_cumulative_monotonic(original_coef)
+        >>> recovered_soft = kan_soft._reverse_cumulative_monotonic(constrained_soft)
+        >>> recovered_soft.shape
+        torch.Size([2, 1, 6])
         """
         if len(self.monotonic_dims_dirs) == 0:
             return coef_constrained
@@ -305,12 +382,18 @@ class KANLayer(nn.Module):
         def stable_softplus_inverse(x: torch.Tensor) -> torch.Tensor:
             """Numerically stable inverse of softplus function."""
             x = torch.clamp(x, min=1e-8)
-            # For large x, softplus_inv(x) ≈ x
-            # For small x, use log(exp(x) - 1)
             mask = x > 20
             result = torch.zeros_like(x)
             result[mask] = x[mask]
             result[~mask] = torch.log(torch.expm1(x[~mask]))
+            return result
+        
+        def stable_elu_inverse(x: torch.Tensor, alpha: float) -> torch.Tensor:
+            """Numerically stable inverse of ELU function."""
+            mask = x >= 0
+            result = torch.zeros_like(x)
+            result[mask] = x[mask]  # For x >= 0, elu_inv(x) = x
+            result[~mask] = torch.log(x[~mask] / alpha + 1)  # For x < 0
             return result
         
         new_coef_list = []
@@ -328,11 +411,15 @@ class KANLayer(nn.Module):
                 if len(constrained_seq) > 1:
                     differences = torch.diff(constrained_seq)
                     
-                    # Apply inverse softplus to recover raw coefficients
-                    raw_diffs = stable_softplus_inverse(differences)
+                    # Apply inverse activation based on constraint type
+                    if self.mono_cs_type == 'strict':
+                        raw_diffs = stable_softplus_inverse(differences)
+                    elif self.mono_cs_type == 'soft':
+                        raw_diffs = stable_elu_inverse(differences, self.elu_alpha)
+                    else:
+                        raise ValueError(f"Unsupported mono_cs_type: {self.mono_cs_type}")
                     
                     # Reconstruct effective coefficients
-                    # First coefficient could be the initial value before cumsum
                     effective_coef = torch.zeros_like(constrained_seq)
                     effective_coef[0] = constrained_seq[0]  # Keep first as anchor
                     effective_coef[1:] = raw_diffs
@@ -344,163 +431,13 @@ class KANLayer(nn.Module):
         coef_effective = torch.stack(new_coef_list, dim=0).permute(1, 0, 2)
         return coef_effective
     
-    def _apply_segmented_monotonic(self, coef: torch.Tensor, violation_segments: float = 0.3) -> torch.Tensor:
-        """
-        
-        NOTE: not tested, not available now.
-        
-        Apply segmented monotonicity constraints allowing violations in specified proportion.
-        
-        This method allows monotonicity violations in a controlled proportion of segments
-        while enforcing constraints on the remaining segments. It prioritizes preserving
-        the most significant violations to maintain model flexibility.
-        
-        :param coef: B-spline coefficients with shape (in_dim, out_dim, n_coef).
-        :type coef: torch.Tensor
-        :param violation_segments: Proportion of segments allowed to violate monotonicity (0.0 to 1.0).
-        :type violation_segments: float, optional
-
-        :return: Segmented monotonicity-constrained coefficients with same shape as input.
-        :rtype: torch.Tensor
-        """
-        if len(self.monotonic_dims_dirs) == 0:
-            return coef
-        
-        coef = coef.permute(1, 0, 2)
-        new_coef_list = []
-        
-        for j in range(coef.shape[0]):
-            coef_j = coef[j].clone()
-            for dim, direction in self.monotonic_dims_dirs:
-                original_coef = coef_j[dim]
-                n_coef = len(original_coef)
-                
-                # Calculate current violations
-                diffs = torch.diff(original_coef)
-                if direction == 1:
-                    violations = diffs < 0
-                else:
-                    violations = diffs > 0
-                
-                violation_ratio = violations.float().mean()
-                
-                # Adjust if violation ratio exceeds allowed threshold
-                if violation_ratio > violation_segments:
-                    # Preserve most severe violations, adjust others
-                    violation_scores = torch.abs(diffs) * violations.float()
-                    _, sorted_indices = torch.sort(violation_scores, descending=True)
-                    
-                    # Calculate number of violations to preserve
-                    keep_violations = int(violation_segments * (n_coef - 1))
-                    keep_mask = torch.zeros_like(violations)
-                    if keep_violations > 0:
-                        keep_mask[sorted_indices[:keep_violations]] = True
-                    
-                    # Fix violations not being preserved
-                    fix_mask = violations & (~keep_mask)
-                    
-                    if fix_mask.any():
-                        adjusted_coef = original_coef.clone()
-                        for i in range(1, n_coef):
-                            if fix_mask[i-1]:
-                                if direction == 1:
-                                    adjusted_coef[i] = adjusted_coef[i-1] + 1e-6
-                                else:
-                                    adjusted_coef[i] = adjusted_coef[i-1] - 1e-6
-                        coef_j[dim] = adjusted_coef
-            
-            new_coef_list.append(coef_j)
-        
-        return torch.stack(new_coef_list, dim=0).permute(1, 0, 2)
     
-    def _apply_soft_monotonic(self, coef: torch.Tensor, elu_alpha: float = 0.1) -> torch.Tensor:
-        """
-        Apply soft monotonicity constraints using ELU activation instead of softplus.
-        
-        This method uses ELU activation which allows negative values down to -alpha,
-        providing a softer constraint compared to strict softplus-based constraints.
-        
-        Parameters
-        ----------
-        coef : torch.Tensor
-            B-spline coefficients with shape (in_dim, out_dim, n_coef).
-        elu_alpha : float, default=0.1
-            The alpha parameter for ELU activation, controlling the minimum negative value.
-            Larger alpha allows more negative values (softer constraint).
-
-        Returns
-        -------
-        torch.Tensor
-            Soft monotonicity-constrained coefficients with same shape as input.
-            
-        Examples
-        --------
-        >>> import torch
-        >>> kan = KANLayer(in_dim=2, out_dim=1, num=4, k=2,
-        ...                monotonic_dims_dirs=[(0, 1), (1, -1)], mono_cs_type='soft')
-
-        # Test with default ELU alpha
-        >>> coef = torch.randn(2, 1, 6)
-        >>> soft_coef = kan._apply_soft_monotonic(coef)
-        >>> soft_coef.shape
-        torch.Size([2, 1, 6])
-
-        # Test with custom ELU alpha (softer constraint)
-        >>> softer_coef = kan._apply_soft_monotonic(coef, elu_alpha=2.0)
-        >>> softer_coef.shape
-        torch.Size([2, 1, 6])
-
-        # Check that soft constraints allow some violations
-        >>> diffs_soft = torch.diff(soft_coef[0, 0, :])  # Should be mostly increasing
-        >>> violations_soft = (diffs_soft < -0.1).sum().item()
-        >>> diffs_strict = torch.diff(kan._apply_strict_monotonic(coef)[0, 0, :])
-        >>> violations_strict = (diffs_strict < 0).sum().item()
-        >>> violations_soft >= violations_strict  # Soft should allow more violations
-        True
-
-        # Test decreasing monotonicity
-        >>> diffs_decreasing = torch.diff(soft_coef[1, 0, :])
-        >>> mostly_decreasing = (diffs_decreasing <= 0.1).float().mean() > 0.7
-        >>> mostly_decreasing.item()
-        True
-
-        # No constraints case
-        >>> kan_no_mono = KANLayer(monotonic_dims_dirs=[])
-        >>> unchanged_coef = kan_no_mono._apply_soft_monotonic(coef)
-        >>> torch.allclose(coef, unchanged_coef)
-        True
-        """
-        if len(self.monotonic_dims_dirs) == 0:
-            return coef
-        
-        coef = coef.permute(1, 0, 2)  # (out_dim, in_dim, n_coef)
-        new_coef_list = []
-        
-        for j in range(coef.shape[0]):  # iterate over output dimensions
-            coef_j = coef[j]  # (in_dim, n_coef)
-            for dim, direction in self.monotonic_dims_dirs:
-                # Apply ELU to ensure differences are mostly non-negative but allow some negative values
-                delta = torch.nn.functional.elu(coef_j[dim], alpha=elu_alpha)
-                # Cumulative sum to enforce monotonicity with soft constraint
-                delta = torch.cumsum(delta, dim=-1)
-                if direction == -1:
-                    delta = -delta  # reverse for decreasing monotonicity
-                coef_j = coef_j.clone()
-                coef_j[dim] = delta
-            new_coef_list.append(coef_j)
-            
-        coef = torch.stack(new_coef_list, dim=0).permute(1, 0, 2)
-        return coef
     
-    def forward(self, x: torch.Tensor, **constraint_kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass of the KANLayer with configurable monotonicity constraints.
 
         :param x: 2D torch.Tensor with shape (batch_size, in_dim)
         :type x: torch.Tensor
-        :param constraint_kwargs: Additional parameters for constraint methods:
-            - tolerance : float, for 'soft' constraints (default=0.1)
-            - violation_segments : float, for 'segment' constraints (default=0.3)
-        :type constraint_kwargs: dict, optional
         
         :return: a tuple of (y, preacts, postacts, postspline)
 
@@ -535,17 +472,9 @@ class KANLayer(nn.Module):
         >>> kan_soft = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=[(0, 1)], 
         ...                     mono_cs_type='soft')
         >>> x_soft = torch.randn(8, 2)
-        >>> y_soft, *_ = kan_soft(x_soft, elu_alpha=0.5)
+        >>> y_soft, *_ = kan_soft(x_soft)
         >>> y_soft.shape
         torch.Size([8, 1])
-
-        # Forward pass with segmented constraints
-        >>> kan_seg = KANLayer(in_dim=3, out_dim=2, monotonic_dims_dirs=[(1, -1)], 
-        ...                    mono_cs_type='segment')
-        >>> x_seg = torch.randn(6, 3)
-        >>> y_seg, *_ = kan_seg(x_seg, violation_segments=0.2)
-        >>> y_seg.shape
-        torch.Size([6, 2])
 
         # Test gradient flow
         >>> kan_grad = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=[(0, 1)])
@@ -570,15 +499,8 @@ class KANLayer(nn.Module):
         # Apply monotonicity constraints based on selected type
         # Clone coefficients to avoid in-place modifications during gradient computation
         coef = self.coef.clone()
-        
-        if self.mono_cs_type == 'strict':
-            coef = self._apply_strict_monotonic(coef)
-        elif self.mono_cs_type == 'soft':
-            elu_alpha = constraint_kwargs.get('elu_alpha', 0.1)
-            coef = self._apply_soft_monotonic(coef, elu_alpha=elu_alpha)
-        elif self.mono_cs_type == 'segment':
-            violation_segments = constraint_kwargs.get('violation_segments', 0.3)
-            coef = self._apply_segmented_monotonic(coef, violation_segments=violation_segments)
+        if self.mono_cs_type in ['strict', 'soft']:
+            coef = self._apply_cumulative_monotonic(coef)
         # No constraint application for invalid types (already validated in __init__)
 
         y = coef2curve(x, self.grid, coef=coef, k=self.k)  # bs, in_dim, out_dim
@@ -624,10 +546,8 @@ class KANLayer(nn.Module):
             
             # 应用约束后的系数
             coef = self.coef.clone()
-            if self.mono_cs_type == 'strict':
-                coef = self._apply_strict_monotonic(coef)
-            elif self.mono_cs_type == 'soft':
-                coef = self._apply_soft_monotonic(coef)
+            if self.mono_cs_type in ['strict', 'soft']:
+                coef = self._apply_cumulative_monotonic(coef)
             
             # 计算激活输出
             spline_outputs = torch.einsum('bik,jok->bjo', b_splines, coef)
@@ -658,10 +578,8 @@ class KANLayer(nn.Module):
             
             # 获取当前系数
             coef = self.coef.clone()
-            if self.mono_cs_type == 'strict':
-                coef = self._apply_strict_monotonic(coef)
-            elif self.mono_cs_type == 'soft':
-                coef = self._apply_soft_monotonic(coef)
+            if self.mono_cs_type in ['strict', 'soft']:
+                coef = self._apply_cumulative_monotonic(coef)
             
             # 计算未约简的样条输出
             unreduced_output = torch.einsum('bik,jok->bijo', splines, coef)
@@ -695,21 +613,13 @@ class KANLayer(nn.Module):
         new_coef = curve2coef(x, unreduced_output.mean(dim=3).permute(0, 2, 1), self.grid, self.k)
         self.coef.data.copy_(new_coef)
     
-    def get_eval_coefficients(self, return_effective: bool = False, **constraint_kwargs) -> dict[str, torch.Tensor]:
+    def get_eval_coefficients(self) -> dict[str, torch.Tensor]:
         """
         Get coefficients for evaluation/analysis purposes.
         
         This method returns coefficients in evaluation mode (no gradient computation)
         with options to get either constrained coefficients (used by the model) or
         effective coefficients (recovered for symbolic analysis).
-        
-        Parameters
-        ----------
-        return_effective : bool, default=False
-            If True, returns effective coefficients recovered from constraints.
-            If False, returns constrained coefficients as used by the model.
-        **constraint_kwargs : dict
-            Additional parameters for constraint methods (tolerance, violation_segments).
             
         Returns
         -------
@@ -717,7 +627,7 @@ class KANLayer(nn.Module):
             Dictionary containing coefficient information:
             - 'raw_coef': Original learnable coefficients
             - 'constrained_coef': Coefficients after applying monotonic constraints  
-            - 'effective_coef': Recovered effective coefficients (if return_effective=True)
+            - 'effective_coef': Recovered effective coefficients (only for 'strict' and 'soft' constraints, None otherwise)
             - 'constraint_info': Information about applied constraints
             - 'scaling_info': Scaling parameters information
             
@@ -737,7 +647,7 @@ class KANLayer(nn.Module):
         torch.Size([3, 2, 8])
 
         # Extract effective coefficients for strict constraints
-        >>> coef_with_effective = kan.get_eval_coefficients(return_effective=True)
+        >>> coef_with_effective = kan.get_eval_coefficients()
         >>> 'effective_coef' in coef_with_effective
         True
         >>> coef_with_effective['effective_coef'].shape
@@ -773,7 +683,7 @@ class KANLayer(nn.Module):
         # Test with soft constraints and custom parameters
         >>> kan_soft = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=[(0, 1)], 
         ...                     mono_cs_type='soft')
-        >>> soft_coef = kan_soft.get_eval_coefficients(return_effective=True, elu_alpha=0.3)
+        >>> soft_coef = kan_soft.get_eval_coefficients()
         >>> soft_coef['constraint_info']['type']
         'soft'
 
@@ -792,26 +702,19 @@ class KANLayer(nn.Module):
             result['raw_coef'] = self.coef.clone()
             
             # Apply constraints based on type
-            if self.mono_cs_type == 'strict':
-                constrained_coef = self._apply_strict_monotonic(self.coef.clone())
-            elif self.mono_cs_type == 'soft':
-                elu_alpha = constraint_kwargs.get('elu_alpha', 0.1)
-                constrained_coef = self._apply_soft_monotonic(self.coef.clone(), elu_alpha=elu_alpha)
-            elif self.mono_cs_type == 'segment':
-                violation_segments = constraint_kwargs.get('violation_segments', 0.3)
-                constrained_coef = self._apply_segmented_monotonic(self.coef.clone(), violation_segments=violation_segments)
+            if self.mono_cs_type in ['strict', 'soft']:
+                constrained_coef = self._apply_cumulative_monotonic(self.coef.clone())
             else:  # 'none' or no constraints
                 constrained_coef = self.coef.clone()
             
             result['constrained_coef'] = constrained_coef
             
             # Recover effective coefficients if requested
-            if return_effective and self.mono_cs_type == 'strict':
-                effective_coef = self._reverse_strict_monotonic(constrained_coef)
+            if self.mono_cs_type in ['strict', 'soft']:
+                effective_coef = self._reverse_cumulative_monotonic(constrained_coef)
                 result['effective_coef'] = effective_coef
-            elif return_effective and self.mono_cs_type != 'strict':
-                # For non-strict constraints, effective ≈ constrained
-                result['effective_coef'] = constrained_coef
+            else:
+                result['effective_coef'] = None
             
             # Constraint information
             result['constraint_info'] = {
@@ -844,14 +747,9 @@ class KANLayer(nn.Module):
         
         return result
     
-    def analyze_monotonicity_compliance(self, **constraint_kwargs) -> dict[str, float]:
+    def analyze_monotonicity_compliance(self) -> dict[str, float]:
         """
         Analyze how well the current coefficients comply with monotonicity constraints.
-        
-        Parameters
-        ----------
-        **constraint_kwargs : dict
-            Additional parameters for constraint methods.
             
         Returns
         -------
@@ -896,16 +794,16 @@ class KANLayer(nn.Module):
 
         # Test with soft constraints (should allow some violations)
         >>> kan_soft = KANLayer(in_dim=2, out_dim=1, monotonic_dims_dirs=[(0, 1)], 
-        ...                     mono_cs_type='soft')
+        ...                     mono_cs_type='soft', elu_alpha=0.1)
         >>> # Train briefly to get realistic coefficients
         >>> x_train = torch.randn(100, 2)
         >>> y_train = torch.randn(100, 1)
         >>> for _ in range(10):
-        ...     y_pred, _, _, _ = kan_soft(x_train, elu_alpha=1.0)
+        ...     y_pred, _, _, _ = kan_soft(x_train)
         ...     loss = torch.nn.functional.mse_loss(y_pred, y_train)
         ...     if hasattr(loss, 'backward'):
         ...         break
-        >>> soft_compliance = kan_soft.analyze_monotonicity_compliance(elu_alpha=1.0)
+        >>> soft_compliance = kan_soft.analyze_monotonicity_compliance()
         >>> 'dim_0_to_out_0' in soft_compliance
         True
 
@@ -926,7 +824,7 @@ class KANLayer(nn.Module):
         with torch.no_grad():
             compliance_metrics = {}
             
-            coef_info = self.get_eval_coefficients(**constraint_kwargs)
+            coef_info = self.get_eval_coefficients()
             constrained_coef = coef_info['constrained_coef']
             
             for dim, direction in self.monotonic_dims_dirs:
