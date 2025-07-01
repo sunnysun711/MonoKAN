@@ -118,9 +118,6 @@ class KANLayer(nn.Module):
         :param device: the device to run the model, defaults to 'cpu'
         :type device: str | torch.device, optional
         
-        :return: self
-        :rtype: KANLayer
-        
         Example::
 
             >>> from src.KANLayer import KANLayer, torch
@@ -272,9 +269,9 @@ class KANLayer(nn.Module):
             >>> coef_soft_constrained.shape
             torch.Size([3, 2, 8])
             
-            # Verify decreasing constraint for dimension 1, should be True (still possible to be False)
+            # Verify decreasing constraint for dimension 1, should be True
             >>> diffs_decreasing = torch.diff(coef_soft_constrained[1, 0, :])
-            >>> (diffs_decreasing <= 0).all().item()
+            >>> (diffs_decreasing <= 0).all().item()  # possibly False
             True
             
             # Test softer example:
@@ -637,53 +634,65 @@ class KANLayer(nn.Module):
                 lambda_entropy * entropy_total + 
                 lambda_smoothness * smoothness_loss)
 
-    def update_grid(self, x: torch.Tensor, margin: float = 0.01):
+    def update_grid(self, x: torch.Tensor, margin: float = 0.0, grid_eps: float = 0.02):
         """
-        NOTE: NOT TESTED YET.
+        Update the grid points based on input samples for better coverage and adaptivity.
+
+        :param x: Input samples, shape (batch, in_dim)
+        :param margin: Extra margin added to grid range, default 0.0
+        :param grid_eps: Mixing factor between adaptive and uniform grid, default 0.02
+        
+        Example::
+
+            >>> model = KANLayer(in_dim=1, out_dim=1, num=5, k=3)
+            >>> model.grid  # Original uniform grid
+            Parameter containing:
+            tensor([[-2.2000, -1.8000, -1.4000, -1.0000, -0.6000, -0.2000,  0.2000,  0.6000,
+                      1.0000,  1.4000,  1.8000,  2.2000]])
+            
+            # Create skewed data distribution - most data near 0, few points at extremes
+            >>> x = torch.cat([torch.randn(100).unsqueeze(1), torch.tensor([[-2.8], [3.1], [-2.9], [3.2]])], dim=0)
+            
+            # Update grid to adapt to data distribution
+            >>> model.update_grid(x)
+            >>> model.grid  # New grid is denser around 0 (where most data is) and covers outliers # doctest: +SKIP
+            Parameter containing:
+            tensor([[-6.5600, -5.3400, -4.1200, -2.9000, -0.6487, -0.0982,  0.4214,  0.9443,
+                      3.2000,  4.4200,  5.6400,  6.8600]])
         """
         assert x.dim() == 2 and x.size(1) == self.in_dim
         batch = x.size(0)
-        
-        # 计算当前输出
-        with torch.no_grad():
-            splines = B_batch(x, self.grid, k=self.k)
-            
-            # 获取当前系数
-            coef = self.coef.clone()
-            if self.monotonic_dims_dirs:
-                coef = self._apply_cumulative_monotonic(coef)
-            
-            # 计算未约简的样条输出
-            unreduced_output = torch.einsum('bik,jok->bijo', splines, coef)
-        
-        # 按通道排序收集数据分布
-        x_sorted = torch.sort(x, dim=0)[0]
-        grid_adaptive = x_sorted[
-            torch.linspace(0, batch - 1, self.num + 1, dtype=torch.int64, device=x.device)
-        ]
-        
-        uniform_step = (x_sorted[-1] - x_sorted[0] + 2 * margin) / self.num
+
+        # Sort input for adaptive grid
+        x_sorted = torch.sort(x, dim=0)[0]  # (batch, in_dim)
+        # Adaptive grid: quantiles
+        idx = torch.linspace(0, batch - 1, self.num + 1, dtype=torch.long, device=x.device)
+        grid_adaptive = x_sorted[idx, :]  # (num+1, in_dim)
+
+        # Uniform grid
+        x_min = x_sorted[0] - margin
+        x_max = x_sorted[-1] + margin
+        uniform_step = (x_max - x_min) / self.num  # (in_dim,)
         grid_uniform = (
-            torch.arange(self.num + 1, dtype=torch.float32, device=x.device).unsqueeze(1)
-            * uniform_step + x_sorted[0] - margin
-        )
-        
-        # 混合自适应和均匀网格
-        grid_eps = 0.02
-        grid = grid_eps * grid_uniform + (1 - grid_eps) * grid_adaptive
-        
-        # 扩展网格
-        grid = torch.concatenate([
-            grid[:1] - uniform_step * torch.arange(self.k, 0, -1, device=x.device).unsqueeze(1),
-            grid,
-            grid[-1:] + uniform_step * torch.arange(1, self.k + 1, device=x.device).unsqueeze(1),
-        ], dim=0)
-        
-        # 更新网格和系数
-        self.grid.copy_(grid.T)
-        # 重新拟合系数
-        new_coef = curve2coef(x, unreduced_output.mean(dim=3).permute(0, 2, 1), self.grid, self.k)
-        self.coef.data.copy_(new_coef)
+            torch.arange(self.num + 1, device=x.device).unsqueeze(1) * uniform_step + x_min
+        )  # (num+1, in_dim)
+
+        # Blend adaptive and uniform grid
+        grid_new = grid_eps * grid_uniform + (1 - grid_eps) * grid_adaptive  # (num+1, in_dim)
+
+        # Extend grid for B-spline
+        grid_ext = extend_grid(grid_new.T, k_extend=self.k)  # (in_dim, num+2k+1)
+
+        # Update grid in-place
+        self.grid.data.copy_(grid_ext)
+
+        # Re-fit coefficients using current model output as targets
+        with torch.no_grad():
+            # Use current model to get targets for new grid
+            y_target = coef2curve(x, self.grid, coef=self.coef, k=self.k)  # (batch, in_dim, out_dim)
+            # Fit new coefficients for each (in_dim, out_dim)
+            new_coef = curve2coef(x, y_target, self.grid, self.k)  # (in_dim, batch, out_dim) or (in_dim, out_dim, n_coef)
+            self.coef.data.copy_(new_coef)
     
     def get_eval_coefficients(self) -> dict[str, torch.Tensor]:
         """
