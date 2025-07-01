@@ -5,24 +5,21 @@ def B_batch(x: torch.Tensor, grid: torch.Tensor, k:int=0) -> torch.Tensor:
     """
     Evaludate x on B-spline bases
     
-    :param x: inputs, shape (number of samples, number of splines)
-    :type x: torch.Tensor
-    :param grid: grids, shape (number of splines, number of grid points)
-    :type grid: torch.Tensor
-    :param k: the piecewise polynomial order of splines, defaults to 0
-    :type k: int, optional
+    :param torch.Tensor x: inputs, shape (number of samples, number of splines)
+    :param torch.Tensor grid: grids, shape (number of splines, number of grid points)
+    :param int k: the piecewise polynomial order of splines, defaults to 0
     
-    :return: spline values, shape (batch, in_dim, G-k). G: the number of grid intervals, k: spline order.
-    :rtype: torch.Tensor
+    :return torch.Tensor: spline values, shape (batch, in_dim, G-k).
+        G: the number of grid intervals, k: spline order.
 
-    Example
-    -------
-    >>> from src.spline import B_batch, torch
-    >>> m=100; n=5; k=3; G=20; out_dim=2
-    >>> x = torch.rand(m, n)
-    >>> grid = torch.linspace(-1,1,steps=G+1).repeat(n, 1)  # n, G+1
-    >>> B_batch(x, grid, k=3).shape  # m, n, G-k
-    torch.Size([100, 5, 7])
+    Example::
+    
+        >>> from src.spline import B_batch, torch
+        >>> m=100; n=5; k=3; G=20; out_dim=2
+        >>> x = torch.rand(m, n)
+        >>> grid = torch.linspace(-1,1,steps=G+1).repeat(n, 1)  # n, G+1
+        >>> B_batch(x, grid, k=3).shape  # m, n, G-k
+        torch.Size([100, 5, 17])
     """
     
     x = x.unsqueeze(dim=2)
@@ -44,34 +41,31 @@ def B_batch(x: torch.Tensor, grid: torch.Tensor, k:int=0) -> torch.Tensor:
 
 def coef2curve(x_eval:torch.Tensor, extended_grid:torch.Tensor, coef:torch.Tensor, k:int=0) -> torch.Tensor:
     """
-    Converting B-spline coefficients to B-spline curves. Evaluate x on B-spline curves (summing up B_batch results over B-spline basis).
+    Converting B-spline coefficients to B-spline curves. 
+    Evaluate x on B-spline curves (summing up B_batch results over B-spline basis).
     
-    :param x_eval: 2D torch.tensor
+    :param torch.Tensor x_eval: 2D torch.tensor
         shape (batch, in_dim)
-    :type x_eval: torch.Tensor
-    :param extended_grid: 2D torch.tensor
+    :param torch.Tensor extended_grid: 2D torch.tensor
         shape (in_dim, G+2k+1). G: num grid intervals; k: spline order.
-    :type extended_grid: torch.Tensor
-    :param coef: 3D torch.tensor
+    :param torch.Tensor coef: 3D torch.tensor
         shape (in_dim, out_dim, G+k)
-    :type coef: torch.Tensor
-    :param k: the piecewise polynomial order of splines, defaults to 0
-    :type k: int, optional
+    :param int k: the piecewise polynomial order of splines, defaults to 0
     
     :return: y_eval, shape (batch, in_dim, out_dim)
     :rtype: torch.Tensor
     
-    Example
-    -------
-    >>> from src.spline import torch, coef2curve, extend_grid
-    >>> m=100; n=5; k=3; G=10; out_dim=2
-    >>> x_eval = torch.rand(m, n)
-    >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(n, 1)
-    >>> extended_grid = extend_grid(grid, k_extend=k)  # (n, G+2k+1)
-    >>> coef = torch.rand(n, out_dim, G+k)
-    >>> y_eval = coef2curve(x_eval, extended_grid, coef, k=k)
-    >>> y_eval.shape  # batch, in_dim, out_dim
-    torch.Size([100, 5, 2])
+    Example::
+    
+        >>> from src.spline import torch, coef2curve, extend_grid
+        >>> m=100; n=5; k=3; G=10; out_dim=2
+        >>> x_eval = torch.rand(m, n)
+        >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(n, 1)
+        >>> extended_grid = extend_grid(grid, k_extend=k)  # (n, G+2k+1)
+        >>> coef = torch.rand(n, out_dim, G+k)
+        >>> y_eval = coef2curve(x_eval, extended_grid, coef, k=k)
+        >>> y_eval.shape  # batch, in_dim, out_dim
+        torch.Size([100, 5, 2])
     """
     
     b_splines = B_batch(x_eval, extended_grid, k=k)
@@ -84,33 +78,29 @@ def curve2coef(x_eval:torch.Tensor, y_eval:torch.Tensor, extended_grid:torch.Ten
     """
     Converting B-spline curves to B-spline coefficients using least squares.
     
-    :param x_eval: 2D torch.tensor
+    :param torch.Tensor x_eval: 2D torch.tensor
         shape (batch, in_dim)
-    :type x_eval: torch.Tensor
-    :param y_eval: 3D torch.tensor
+    :param torch.Tensor y_eval: 3D torch.tensor
         shape (batch, in_dim, out_dim)
-    :type y_eval: torch.Tensor
-    :param extended_grid: 2D torch.tensor
+    :param torch.Tensor extended_grid: 2D torch.tensor
         shape (in_dim, G+2k+1)
-    :type extended_grid: torch.Tensor
-    :param k: the piecewise polynomial order of splines, defaults to 0
-    :type k: int, optional
+    :param int k: the piecewise polynomial order of splines, defaults to 0
     
     :raise RuntimeError: if least squares fails
-    :return: coef, shape (in_dim, out_dim, G+k)
-    :rtype: torch.Tensor
     
-    Example
-    -------
-    >>> from src.spline import torch, curve2coef, extend_grid
-    >>> m=100; n=5; k=3; G=10; out_dim=2
-    >>> x_eval = torch.rand(m, n)
-    >>> y_eval = torch.rand(m, n, out_dim)
-    >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(n, 1)
-    >>> extended_grid = extend_grid(grid, k_extend=k)  # (n, G+2k+1)
-    >>> coef = curve2coef(x_eval, y_eval, extended_grid, k=k)
-    >>> coef.shape  # in_dim, out_dim, G+k
-    torch.Size([5, 2, 13])
+    :return torch.Tensor: coef, shape (in_dim, out_dim, G+k)
+    
+    Example::
+    
+        >>> from src.spline import torch, curve2coef, extend_grid
+        >>> m=100; n=5; k=3; G=10; out_dim=2
+        >>> x_eval = torch.rand(m, n)
+        >>> y_eval = torch.rand(m, n, out_dim)
+        >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(n, 1)
+        >>> extended_grid = extend_grid(grid, k_extend=k)  # (n, G+2k+1)
+        >>> coef = curve2coef(x_eval, y_eval, extended_grid, k=k)
+        >>> coef.shape  # in_dim, out_dim, G+k
+        torch.Size([5, 2, 13])
     """
     #print('haha', x_eval.shape, y_eval.shape, grid.shape)
     batch = x_eval.shape[0]
@@ -149,22 +139,19 @@ def extend_grid(grid:torch.Tensor, k_extend:int=0) -> torch.Tensor:
     """
     Extend grid by k points on both ends
     
-    :param grid: 2D torch.tensor, shape (in_dim, G+1), where G is the number of grid intervals
-    :type grid: torch.Tensor
-    :param k_extend: number of points to extend on both ends, defaults to 0
-    :type k_extend: int, optional
+    :param torch.Tensor grid: 2D torch.tensor, shape (in_dim, G+1), where G is the number of grid intervals
+    :param int k_extend: number of points to extend on both ends, defaults to 0
     
-    :return: extended grid, shape (in_dim, G+2k+1)
-    :rtype: torch.Tensor
+    :return torch.Tensor: extended grid, shape (in_dim, G+2k+1)
     
-    Example
-    -------
-    >>> from src.spline import extend_grid, torch
-    >>> G=10; k=3; in_dim=2;  # number of grid intervals, spline order, input dimension (number of splines)
-    >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(in_dim, 1)
-    >>> extended_grid = extend_grid(grid, k_extend=k)
-    >>> extended_grid.shape  # in_dim, G+2k+1
-    torch.Size([2, 17])
+    Example::
+    
+        >>> from src.spline import extend_grid, torch
+        >>> G=10; k=3; in_dim=2;  # number of grid intervals, spline order, input dimension (number of splines)
+        >>> grid = torch.linspace(-1, 1, steps=G+1).repeat(in_dim, 1)
+        >>> extended_grid = extend_grid(grid, k_extend=k)
+        >>> extended_grid.shape  # in_dim, G+2k+1
+        torch.Size([2, 17])
     """
     h = (grid[:, [-1]] - grid[:, [0]]) / (grid.shape[1] - 1)
 

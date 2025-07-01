@@ -72,7 +72,6 @@ def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]]
         print(f"Using device: {device}")
     
     # Generate training data
-    torch.manual_seed(42)
     N = 10000
     x_train = torch.rand(N, 3) * 2 - 1  # uniform(-1, 1)
     y_train = true_func(x_train)
@@ -111,7 +110,7 @@ def train_model(constraint_type: str, monotonic_dims_dirs: list[tuple[int, int]]
     for epoch in range(max_epochs):
         model.train()
         y_pred, *_ = model(x_train)
-        loss = loss_fn(y_pred, y_train)
+        loss = loss_fn(y_pred, y_train) + model.regularization_loss(lambda_l1=1e-2, lambda_entropy=2e-2, lambda_smoothness=0)
         
         optimizer.zero_grad()
         loss.backward()
@@ -272,7 +271,7 @@ def run_monotonic_constraints_comparison():
     
     constraint_configs = {
         'strict': {},
-        'soft': {'elu_alpha': 0.02},
+        'soft': {'elu_alpha': 0.002},
         'unconstrained': {}
     }
     
@@ -287,7 +286,7 @@ def run_monotonic_constraints_comparison():
             monotonic_dims_dirs=monotonic_dims_dirs,
             constraint_kwargs=constraint_kwargs,
             verbose=True,
-            max_epochs=6000,
+            max_epochs=2000,
         )
         models[constraint_type] = model
         loss_histories[constraint_type] = loss_history
@@ -337,6 +336,7 @@ def run_monotonic_constraints_comparison():
 # Example usage for notebook
 if __name__ == "__main__":
     # Run the comparison
+    # torch.manual_seed(42)
     models, compliance_results, loss_histories = run_monotonic_constraints_comparison()
     
     print("\n=== Summary ===")
