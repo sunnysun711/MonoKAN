@@ -82,20 +82,14 @@ class KANLayer(nn.Module):
                  ):
         """initilize a KANLayer
 
-        :param in_dim: input dimension, defaults to 3
-        :type in_dim: int, optional
-        :param out_dim: output dimension, defaults to 2
-        :type out_dim: int, optional
-        :param num: the number of grid intervals = G, defaults to 5
-        :type num: int, optional
-        :param k: the piecewise polynomial order of splines, defaults to 3
-        :type k: int, optional
-        :param sparse_init: whether to initialize the coefficients with sparse mask, defaults to False.
+        :param int in_dim: input dimension, defaults to 3
+        :param int out_dim: output dimension, defaults to 2
+        :param int num: the number of grid intervals = G, defaults to 5
+        :param int k: the piecewise polynomial order of splines, defaults to 3
+        :param bool sparse_init: whether to initialize the coefficients with sparse mask, defaults to False.
             If True, the coefficients will be initialized with a sparse mask, which can help to reduce the number of parameters.
-        :type sparse_init: bool, optional
-        :param include_basis: whether to include basis in each spline, defaults to True, including a linear basis in the output (instead of just the splines).
+        :param bool include_basis: whether to include basis in each spline, defaults to True, including a linear basis in the output (instead of just the splines).
             To speed up the convergence, it is recommended to include the basis.
-        :type include_basis: bool, optional
         :param grid_range: the range of grid points, defaults to [-1., 1.]
         :type grid_range: list[float], optional
         :param monotonic_dims_dirs: the dimensions of monotonic input dimensions and their directions, defaults to None

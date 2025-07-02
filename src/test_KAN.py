@@ -93,7 +93,8 @@ def create_dcm_swissmetro_dataset(
         )
         # Add Gaussian noise
         batch = x.shape[0]
-        noise = noise_std * torch.randn(batch, 3)
+        # noise = noise_std * torch.randn(batch, 3)
+        noise = torch.zeros(batch, 3)
         return torch.stack([u_train, u_sm, u_car], dim=1) + noise
 
     def generate_choices(x):
@@ -173,7 +174,7 @@ def test_multikan():
         [2, 2, 2],  # each mult node does two-way interaction
         [],  # output layer
     ]
-    kan = KAN(width, mult_arity=2, device="cuda", sparse_init=False, auto_save=False)
+    kan = KAN(width, mult_arity=2, grid=10, device="cuda", sparse_init=False, auto_save=False)
 
     dataset = create_dcm_swissmetro_dataset(
         train_num=1000, test_num=100, device="cuda"
@@ -217,27 +218,213 @@ def test_multikan():
         print(f"Train Accuracy: {train_accuracy:.4f}")
         print(f"Test Accuracy: {test_accuracy:.4f}")
     
-    kan.plot(
-        in_vars=[
-            "train_tt",
-            "train_co", 
-            "train_he",
-            "SM_tt",
-            "SM_co",
-            "SM_he",
-            "SM_seats",
-            "car_TT",
-            "car_CO",
-        ],
-        out_vars=["train", "SM", "car"],
-        title="SwissMetro DCM KAN (trained)",
-        varscale=1,
-        scale=0.7,
-        # beta=30,
-        sample=False,
+    # kan.plot(
+    #     in_vars=[
+    #         "train_tt",
+    #         "train_co", 
+    #         "train_he",
+    #         "SM_tt",
+    #         "SM_co",
+    #         "SM_he",
+    #         "SM_seats",
+    #         "car_TT",
+    #         "car_CO",
+    #     ],
+    #     out_vars=["train", "SM", "car"],
+    #     title="SwissMetro DCM KAN (trained)",
+    #     varscale=1,
+    #     scale=0.7,
+    #     # beta=30,
+    #     sample=False,
+    # )
+    # plt.show()
+    
+def test_dnn():
+    
+    class SimpleDNN(torch.nn.Module):
+        def __init__(self, input_dim, output_dim, hidden_layers=[64, 32], device="cpu"):
+            super(SimpleDNN, self).__init__()
+            self.device = device
+            layers = []
+            prev_dim = input_dim
+            for hidden_dim in hidden_layers:
+                layers.append(torch.nn.Linear(prev_dim, hidden_dim))
+                layers.append(torch.nn.ReLU())
+                layers.append(torch.nn.Dropout(0.1))
+                prev_dim = hidden_dim
+            layers.append(torch.nn.Linear(prev_dim, output_dim))
+            self.network = torch.nn.Sequential(*layers)
+            self.to(device)
+        
+        def forward(self, x):
+            return self.network(x)
+    
+    hidden_layers = [128, 64, 32]  # Adjust to match KAN parameter count
+    
+    model = SimpleDNN(
+        input_dim=9, 
+        output_dim=3, 
+        hidden_layers=hidden_layers,
+        device="cuda"
     )
-    plt.show()
     
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"DNN Total parameters: {total_params}")
     
+    dataset = create_dcm_swissmetro_dataset(
+        train_num=1000, test_num=100, device="cuda"
+    )
     
-test_multikan()
+    # Training setup
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = dcm_loss_fn
+    
+    # Training loop
+    model.train()
+    for epoch in range(100):
+        optimizer.zero_grad()
+        
+        utilities = model(dataset["train_input"])
+        loss = criterion(utilities, dataset["train_label"])
+        
+        loss.backward()
+        optimizer.step()
+        
+        if epoch % 20 == 0:
+            print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+    
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        train_utilities = model(dataset["train_input"])
+        train_probs = F.softmax(train_utilities, dim=1)
+        
+        test_utilities = model(dataset["test_input"])
+        test_probs = F.softmax(test_utilities, dim=1)
+        
+        # Calculate accuracy
+        train_pred = torch.argmax(train_probs, dim=1)
+        train_true = torch.argmax(dataset["train_label"], dim=1)
+        train_accuracy = (train_pred == train_true).float().mean()
+        
+        test_pred = torch.argmax(test_probs, dim=1)
+        test_true = torch.argmax(dataset["test_label"], dim=1)
+        test_accuracy = (test_pred == test_true).float().mean()
+        
+        print(f"DNN Train Accuracy: {train_accuracy:.4f}")
+        print(f"DNN Test Accuracy: {test_accuracy:.4f}")
+
+
+def test_dnn_dcm():
+    class DCM_DNN(torch.nn.Module):
+        def __init__(self, alternative_configs, shared_layers=[32, 16], device="cpu"):
+            super(DCM_DNN, self).__init__()
+            self.device = device
+            self.alternative_configs = alternative_configs
+            self.n_alternatives = len(alternative_configs)
+            
+            self.alt_networks = torch.nn.ModuleList()
+            
+            for input_dim, alt_name in alternative_configs:
+                layers = []
+                prev_dim = input_dim
+                
+                for hidden_dim in shared_layers:
+                    layers.append(torch.nn.Linear(prev_dim, hidden_dim))
+                    layers.append(torch.nn.ReLU())
+                    layers.append(torch.nn.Dropout(0.1))
+                    prev_dim = hidden_dim
+                
+                # Output single utility for this alternative
+                layers.append(torch.nn.Linear(prev_dim, 1))
+                
+                alt_network = torch.nn.Sequential(*layers)
+                self.alt_networks.append(alt_network)
+            
+            self.to(device)
+        
+        def forward(self, x):
+            utilities = []
+            # train: x[:, 0:3], SM: x[:, 3:7], car: x[:, 7:9]
+            alt_inputs = [
+                x[:, 0:3],   # train features
+                x[:, 3:7],   # SM features  
+                x[:, 7:9]    # car features
+            ]
+            for i, alt_input in enumerate(alt_inputs):
+                utility = self.alt_networks[i](alt_input)  # [batch, 1]
+                utilities.append(utility)
+            return torch.cat(utilities, dim=1)  # [batch, 3]
+    # Alternative-specific configurations
+    alternative_configs = [
+        (3, "train"),  # train_tt, train_co, train_he
+        (4, "SM"),     # SM_tt, SM_co, SM_he, SM_seats
+        (2, "car")     # car_TT, car_CO
+    ]
+    
+    shared_layers = [32, 16]  # Smaller networks since inputs are separated
+    
+    model = DCM_DNN(
+        alternative_configs=alternative_configs,
+        shared_layers=shared_layers,
+        device="cuda"
+    )
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"DCM-DNN Total parameters: {total_params}")
+    
+    dataset = create_dcm_swissmetro_dataset(
+        train_num=1000, test_num=100, device="cuda"
+    )
+    
+    # Training setup
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = dcm_loss_fn
+    
+    # Training loop
+    model.train()
+    for epoch in range(100):
+        optimizer.zero_grad()
+        
+        utilities = model(dataset["train_input"])
+        loss = criterion(utilities, dataset["train_label"])
+        
+        loss.backward()
+        optimizer.step()
+        
+        if epoch % 20 == 0:
+            print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+    
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        train_utilities = model(dataset["train_input"])
+        train_probs = F.softmax(train_utilities, dim=1)
+        
+        test_utilities = model(dataset["test_input"])
+        test_probs = F.softmax(test_utilities, dim=1)
+        
+        # Calculate accuracy
+        train_pred = torch.argmax(train_probs, dim=1)
+        train_true = torch.argmax(dataset["train_label"], dim=1)
+        train_accuracy = (train_pred == train_true).float().mean()
+        
+        test_pred = torch.argmax(test_probs, dim=1)
+        test_true = torch.argmax(dataset["test_label"], dim=1)
+        test_accuracy = (test_pred == test_true).float().mean()
+        
+        print(f"DCM-DNN Train Accuracy: {train_accuracy:.4f}")
+        print(f"DCM-DNN Test Accuracy: {test_accuracy:.4f}")
+    pass
+
+if __name__ == "__main__":
+    print("=== Testing KAN ===")
+    test_multikan()
+    
+    print("\n=== Testing Standard DNN ===")
+    test_dnn()
+    
+    print("\n=== Testing DCM-specific DNN ===")
+    test_dnn_dcm()
